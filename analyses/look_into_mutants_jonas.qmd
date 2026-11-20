@@ -1,0 +1,1480 @@
+---
+title: "Looking into the stp and stk mutants along the genome"
+subtitle: "Bio253 HS2026 · picking up the mutant group's genomic-position idea — and taking it two steps further"
+author: "Jonas Grossmann (FGCZ), with Claude Code"
+date: today
+---
+
+```{r setup}
+#| include: false
+source("../R/setup.R")
+library(patchwork)
+knitr::opts_chunk$set(fig.align = "center")
+```
+
+::: {.callout-important}
+## What this notebook is
+
+The mutant group had a genuinely good idea: instead of looking at a volcano plot,
+**plot the fold change of every protein against where its gene sits on the
+chromosome**. They did that for `stp_vs_anc_at_TSB` and `stk_vs_anc_at_TSB` and found
+two regions per contrast where many neighbouring proteins move together. This notebook
+(1) reproduces that, (2) puts a number on "clearly above noise" with a permutation test,
+(3) asks what the regions actually are — and the answer is **not** signalling,
+(4) repeats the whole scan on the two **interaction** contrasts, and
+(5) takes all of it into the **phospho** data.
+
+**The short version:** the two biggest "peaks" are almost certainly *genomic* differences
+between the strains, not Stk1/Stp1-dependent regulation — and the phospho samples, an
+independent preparation, confirm one of them. The interaction contrasts remove both by
+construction, and what survives is a **secreted / cell-surface** signature. Along the way
+the phospho data hands us the cleanest signalling result in the whole data set:
+**ReoM Thr7 phosphorylation is completely absent from the `stk` mutant and completely
+intact in `stp`** — see §6.4.
+:::
+
+## 1. Setup: the data plus a genomic axis
+
+The DEA tables are keyed by `protein_key`; the coordinates live in the protein metadata
+table that ships with the repository. One join gives every fold change a position on the
+JE2 chromosome (CP020619.1, 2.87 Mb).
+
+```{r data}
+meta <- read_protein_metadata(cds_only = TRUE) |>
+  select(protein_key, locus_tag, gene = gene_symbol_best, start, end, strand,
+         product, up_protein_name, uniprot_acc, ortholog_quality)
+
+dea <- read_dea("total") |>
+  inner_join(select(meta, protein_key, gene, start, end, strand, up_protein_name),
+             by = "protein_key") |>
+  arrange(start)
+
+# The six contrasts this notebook uses.
+CONTRASTS_MAIN <- c("stp_vs_anc_at_TSB", "stk_vs_anc_at_TSB")
+CONTRASTS_INT  <- c("interaction_stp_vs_anc_at_TSB_vs_SN",
+                    "interaction_stk_vs_anc_at_TSB_vs_SN")
+
+cat(sapply(c(CONTRASTS_MAIN, CONTRASTS_INT), explain_contrast), sep = "\n\n")
+```
+
+So for the **main** contrasts, `diff > 0` means **higher in the mutant** than in the
+wild type. For the **interaction** contrasts, `diff > 0` means the mutant-minus-wild-type
+difference is **larger in TSB than in SN** — i.e. the mutant and the wild type respond
+*differently* to long-term PASN.
+
+```{r coverage}
+tibble(
+  what = c("proteins in the DEA (contaminants dropped)",
+           "of those, with a genome coordinate",
+           "measured values that are imputed from the LOD"),
+  n = c(n_distinct(read_dea("total")$protein_key),
+        n_distinct(dea$protein_key),
+        sum(dea$estimate_type == "lod_imputed"))
+)
+```
+
+The ~70 proteins without a coordinate are contaminants and six-frame pseudogene
+translations. They cannot be placed on the chromosome and are simply absent from every
+plot below.
+
+## 2. Part A — redoing the group's plot
+
+One point per protein, x = start of its gene, y = `diff`. The red line is a rolling
+median over 5 neighbouring genes, which is what makes a "peak" visible: single proteins
+jump around, but a *run* of neighbours moving the same way does not.
+
+```{r manhattan-main}
+#| fig-width: 11
+#| fig-height: 6
+#| fig-cap: "Fold change against genomic position for the two contrasts the group looked at. Red = rolling median over 5 neighbouring genes."
+
+roll_median <- function(v, k = 5) zoo::rollapply(v, k, median, fill = NA, align = "center")
+
+manhattan <- function(d, contrasts, k = 5, title = NULL) {
+  x <- d |>
+    filter(contrast %in% contrasts) |>
+    group_by(contrast) |>
+    arrange(start, .by_group = TRUE) |>
+    mutate(roll = roll_median(diff, k)) |>
+    ungroup()
+
+  ggplot(x, aes(start / 1e6, diff)) +
+    geom_hline(yintercept = 0, colour = "grey70") +
+    geom_point(size = 0.6, alpha = 0.35) +
+    geom_line(aes(y = roll), colour = "#D55E00", linewidth = 0.5) +
+    facet_wrap(~contrast, ncol = 1) +
+    labs(x = "position on the JE2 chromosome (Mb)",
+         y = "diff (log2 fold change)", title = title)
+}
+
+manhattan(dea, CONTRASTS_MAIN)
+```
+
+Two things jump out, one per contrast:
+
+* **`stk_vs_anc_at_TSB`**: a sharp spike just past 2.19 Mb, sitting on what looks like a
+  broad raised plateau from roughly 2.18 to 2.29 Mb.
+* **`stp_vs_anc_at_TSB`**: a deep, wide trough around 2.10–2.12 Mb.
+
+That is exactly what the group described. Now let us put a number on it.
+
+### 2.1 "Clearly above noise" — a permutation test
+
+A rolling median looks convincing even in pure noise, so we need a null. The simplest
+honest one: **keep the fold changes, shuffle which gene they belong to**. That destroys
+genomic neighbourhood while keeping the distribution of `diff` exactly as it is. Anything
+the real data does that 1000 shuffled genomes essentially never do is a real genomic
+clustering.
+
+The window size matters, and this turns out to be the whole point. A **narrow** window
+(5 genes) is sensitive to a short, violent spike. A **wide** window (25 genes) is sensitive
+to a long, modest plateau. We run both.
+
+```{r permutation}
+set.seed(42)
+
+scan_genome <- function(d, contrast_name, k, n_perm = 1000) {
+  x <- d |> filter(contrast == contrast_name) |> arrange(start)
+  observed <- roll_median(x$diff, k)
+  # Null: keep the fold changes, shuffle which gene they belong to.
+  null_max <- replicate(n_perm, max(abs(roll_median(sample(x$diff), k)), na.rm = TRUE))
+  x |> mutate(k = k,
+              window_median = observed,
+              threshold = quantile(null_max, 0.95),
+              is_peak = !is.na(observed) & abs(observed) > threshold)
+}
+
+scans <- bind_rows(lapply(c(5, 25), \(k)
+  bind_rows(lapply(c(CONTRASTS_MAIN, CONTRASTS_INT), \(cc) scan_genome(dea, cc, k)))))
+
+scans |>
+  group_by(k, contrast) |>
+  summarise(threshold = round(first(threshold), 2),
+            `windows above it` = sum(is_peak), .groups = "drop") |>
+  pivot_wider(names_from = k, values_from = c(threshold, `windows above it`))
+```
+
+```{r peak-regions}
+# Merge neighbouring flagged windows into regions.
+peak_regions <- scans |>
+  group_by(k, contrast) |>
+  mutate(idx = row_number()) |>
+  filter(is_peak) |>
+  mutate(region = cumsum(c(1, diff(idx) > k[1]))) |>
+  group_by(k, contrast, region) |>
+  summarise(from_Mb = round(min(start) / 1e6, 3),
+            to_Mb   = round(max(start) / 1e6, 3),
+            windows = n(),
+            peak_window_median = round(window_median[which.max(abs(window_median))], 2),
+            .groups = "drop")
+
+peak_regions |> filter(windows >= 3) |> arrange(contrast, k)
+```
+
+Read that carefully, because it is more interesting than a simple "both peaks confirmed":
+
+* The *stp* trough at **2.11–2.13 Mb** passes at **both** window sizes. It is a genuine,
+  sharp, strong feature.
+* The *stk* feature passes **only at the wide window**, as one long region from
+  **2.17 to 2.28 Mb** — and it fails the narrow-window test completely (0 windows).
+
+The wide scan also flags a few smaller regions the group did not mention — notably
+0.88 Mb in `stp_vs_anc_at_TSB` (the *clfA*/*emp*/SaPI neighbourhood) and 2.10–2.12 Mb in
+`interaction_stk_vs_anc_at_TSB_vs_SN` (the φSa3 residue we come back to in §4.1). They are
+weaker and we do not chase them here, but they are on the table.
+
+That the *stk* feature fails the narrow test is not a weakness of the finding, it is a
+**description** of it: the *stk*
+feature is not a spike at all, it is a **broad plateau** of many genes each moved by a
+modest, very similar amount. A test tuned to spikes cannot see it. The group drew the right
+conclusion from the picture; the statistics just tell us the two features are of different
+*kinds*. That difference turns out to be the key to what they are.
+
+## 3. Part B — what are these two regions?
+
+This is where the story turns. Both regions have an explanation that has nothing to do
+with Ser/Thr signalling.
+
+### 3.1 The *stk* region: a 107 kb block, and it is not a peak but a plateau
+
+Zoom in. Note the two **rRNA operons** that flank the raised region almost exactly.
+
+```{r rrn}
+rrn <- read_tsv(file.path(REPO_ROOT, "data", "raw", "resources", "JE2_genome.gff"),
+                comment = "#", col_names = c("seqid", "src", "type", "start", "end",
+                                             "score", "strand", "phase", "attr"),
+                show_col_types = FALSE) |>
+  filter(type == "rRNA", str_detect(attr, "16S|23S")) |>
+  mutate(operon = cumsum(c(1, diff(start) > 10000))) |>
+  group_by(operon) |>
+  summarise(start = min(start), end = max(end), .groups = "drop")
+
+rrn |> filter(start > 2.1e6, start < 2.4e6) |> mutate(across(c(start, end), ~ .x / 1e6))
+```
+
+```{r stk-block}
+#| fig-width: 10
+#| fig-height: 4
+#| fig-cap: "stk_vs_anc_at_TSB around the raised region. Vertical grey bands: rRNA operons. Nearly every gene between them is up by about the same amount."
+
+BLOCK <- c(2183000, 2291000)   # the two rrn operons bracket this
+
+dea |>
+  filter(contrast == "stk_vs_anc_at_TSB", start > 2.12e6, start < 2.36e6) |>
+  ggplot(aes(start / 1e6, diff)) +
+  annotate("rect", xmin = rrn$start / 1e6, xmax = rrn$end / 1e6,
+           ymin = -Inf, ymax = Inf, fill = "grey80", alpha = 0.7) +
+  geom_hline(yintercept = c(0, 0.7), linetype = c(1, 2), colour = c("grey60", "#D55E00")) +
+  geom_point(aes(colour = start > BLOCK[1] & start < BLOCK[2]), size = 1.4) +
+  scale_colour_manual(values = c("grey50", "#D55E00"), guide = "none") +
+  coord_cartesian(xlim = c(2.12, 2.36)) +
+  labs(x = "position (Mb)", y = "log2 FC, stk vs anc in TSB",
+       caption = "dashed line: +0.7 = 1.6-fold")
+```
+
+```{r block-stats}
+dea |>
+  filter(contrast == "stk_vs_anc_at_TSB") |>
+  mutate(region = if_else(start > BLOCK[1] & start < BLOCK[2], "inside block", "rest of genome")) |>
+  group_by(region) |>
+  summarise(proteins = n(),
+            `median log2 FC` = round(median(diff), 2),
+            `fold change` = round(2^median(diff), 2),
+            `% above +0.3` = round(100 * mean(diff > 0.3)),
+            .groups = "drop")
+```
+
+85 % of the 94 measured proteins in the block go up, against 13 % everywhere else, and the
+whole block moves by the **same** amount (~1.65×). The edges are sharp to the single gene
+and they coincide with the two rRNA operons.
+
+**A coordinated 1.6-fold shift of every protein in one contiguous 107 kb segment, bounded
+by two rRNA operons, is the classic signature of a tandem genomic amplification** —
+recombination between two *rrn* copies duplicating everything in between. A regulatory
+effect does not respect operon-independent genomic boundaries like that; gene dosage does.
+1.6× rather than a clean 2× fits a duplication carried by part of the population.
+
+Now the decisive check — rule 4 of `CLAUDE.md`. If this is a property of the *strain*, it
+must be in **every** `stk` sample and in **every medium**, not just the TSB comparison:
+
+```{r block-per-sample}
+#| fig-width: 8
+#| fig-height: 3.6
+#| fig-cap: "Median abundance of the 94 block proteins minus the median of the rest of the genome, per sample. Each point is one of the 27 samples."
+
+ab <- read_abundances("total") |>
+  inner_join(select(meta, protein_key, start), by = "protein_key")
+
+block_shift <- ab |>
+  mutate(region = case_when(start > BLOCK[1] & start < BLOCK[2] ~ "block",
+                            start < 2177000 | start > 2299000   ~ "rest",
+                            TRUE ~ NA_character_)) |>
+  filter(!is.na(region)) |>
+  group_by(sample, genotype, medium, region) |>
+  summarise(md = median(normalized_abundance, na.rm = TRUE), .groups = "drop") |>
+  pivot_wider(names_from = region, values_from = md) |>
+  mutate(shift = block - rest)
+
+ggplot(block_shift, aes(medium, shift, colour = genotype)) +
+  geom_hline(yintercept = 0, colour = "grey70") +
+  geom_point(size = 2.5, position = position_dodge(width = 0.5)) +
+  scale_colour_manual(values = GENOTYPE_COLOURS) +
+  labs(y = "block minus rest (log2)", x = NULL,
+       title = "The block is up in all 9 stk samples, in all three media")
+```
+
+All nine `stk` samples sit about 0.6 log2 above all nine `anc` and all nine `stp` samples,
+in every medium, with no overlap. This is a **constitutive property of the stk strain**.
+
+What is inside the block matters, because it means the `stk` strain carries an extra copy
+of these genes:
+
+```{r block-content}
+block_genes <- meta |> filter(start > BLOCK[1], start < BLOCK[2])
+
+block_genes |>
+  filter(!is.na(gene)) |>
+  transmute(locus_tag, gene, start_Mb = round(start / 1e6, 3),
+            protein = substr(coalesce(up_protein_name, product), 1, 55)) |>
+  filter(gene %in% c("rsbW", "rsbV", "kdpA", "kdpB", "kdpC", "kdpD", "kdpE", "sceD",
+                     "atpA", "atpB", "atpD", "atpG", "atpH", "murA", "glmS", "glmM",
+                     "luxS", "ddl", "murF", "glyA", "dacA"))
+```
+
+Two of those are worth saying out loud:
+
+* **`B7H15_11470` (the "RNA polymerase sigma factor" right next to `rsbW`/`rsbV`) is
+  `sigB`** — the general stress sigma factor. The block contains the complete
+  *rsbU-rsbV-rsbW-sigB* operon.
+* The block also contains the **whole F1F0 ATP synthase operon** (`atpA/B/D/G/H`) and the
+  **`kdp` potassium operon**.
+
+```{r sigb-check}
+meta |>
+  filter(locus_tag %in% c("B7H15_11465", "B7H15_11470", "B7H15_11475",
+                          "B7H15_11480", "B7H15_11485")) |>
+  transmute(locus_tag, gene, uniprot_acc,
+            protein = substr(up_protein_name, 1, 60))
+```
+
+::: {.callout-warning}
+## Consequence for the whole `stk` story
+If the `stk` strain carries a duplication spanning *sigB*, then **any** σ^B^-dependent
+difference between `stk` and `anc` has a second possible cause that has nothing to do with
+the kinase. σ^B^ controls a large regulon in *S. aureus* including pigment, biofilm and
+many of the very stress responses this course is about. This does not invalidate the
+`stk` comparisons — but it means "Stk1 controls X" needs a stronger argument than "X is
+different in the `stk` mutant".
+:::
+
+**Caveat, stated plainly:** proteomics cannot prove a DNA amplification. What we have shown
+is a sharp, medium-independent, strain-specific, uniform 1.65-fold block bounded by *rrn*
+operons. Amplification is the best explanation, but **whole-genome sequencing of the three
+strains is what would settle it**, and it is cheap.
+
+There is, however, a second measurement we can lean on: the **phospho-enriched** samples
+are a separate preparation with their own normalisation, so they are a genuinely
+independent look at the same strains. They confirm the block — see §6.1.
+
+### 3.2 The *stp* region: the φSa3 prophage
+
+```{r stp-prophage}
+#| fig-width: 10
+#| fig-height: 4
+#| fig-cap: "stp_vs_anc_at_TSB across the prophage. The two hlb fragments (grey) mark where the phage is inserted into the beta-haemolysin gene."
+
+hlb <- meta |> filter(gene == "hlb" | locus_tag %in% c("B7H15_10820", "B7H15_11175"))
+
+dea |>
+  filter(contrast == "stp_vs_anc_at_TSB", start > 2.075e6, start < 2.145e6) |>
+  ggplot(aes(start / 1e6, diff)) +
+  annotate("rect", xmin = hlb$start / 1e6, xmax = hlb$end / 1e6 + 0.0008,
+           ymin = -Inf, ymax = Inf, fill = "grey75") +
+  geom_hline(yintercept = 0, colour = "grey60") +
+  geom_point(aes(shape = estimate_type), size = 1.8, colour = "#009E73") +
+  scale_shape_manual(values = c(observed = 16, lod_imputed = 1)) +
+  labs(x = "position (Mb)", y = "log2 FC, stp vs anc in TSB",
+       shape = NULL, caption = "open circles: at least one group mean imputed from the LOD")
+```
+
+The *hlb* gene (β-haemolysin) appears **twice** in the annotation, at 2.086 Mb and at
+2.129 Mb. That is not an annotation error — it is a gene split in two by a prophage
+inserted into it. In USA300/JE2 that is **φSa3**, the β-haemolysin-converting phage, and
+it carries the human immune-evasion cluster:
+
+```{r iec}
+meta |>
+  filter(locus_tag %in% c("B7H15_10820", "B7H15_10840", "B7H15_10845",
+                          "B7H15_10875", "B7H15_11175")) |>
+  transmute(locus_tag, gene, start_Mb = round(start / 1e6, 3),
+            protein = substr(coalesce(up_protein_name, product), 1, 48))
+```
+
+The genes that are down in `stp` are the phage's **structural and replication module** —
+capsid, portal, tail, terminase, recombinase, DnaD — not the immune-evasion genes at the
+left end:
+
+```{r prophage-detail}
+ab_mean <- ab |>
+  group_by(locus_tag, genotype) |>
+  summarise(mu = mean(normalized_abundance, na.rm = TRUE),
+            n_obs = sum(!is.na(normalized_abundance)), .groups = "drop")
+
+ab_mean |>
+  pivot_wider(names_from = genotype, values_from = c(mu, n_obs)) |>
+  inner_join(select(meta, locus_tag, start, product), by = "locus_tag") |>
+  filter(start > 2.1e6, start < 2.125e6, n_obs_anc >= 6, n_obs_stp >= 3) |>
+  transmute(locus_tag, start_Mb = round(start / 1e6, 3),
+            `stp − anc` = round(mu_stp - mu_anc, 2),
+            `stk − anc` = round(mu_stk - mu_anc, 2),
+            n_anc = n_obs_anc, n_stp = n_obs_stp,
+            product = substr(product, 1, 34)) |>
+  arrange(start_Mb)
+```
+
+```{r prophage-per-sample}
+#| fig-width: 8
+#| fig-height: 3.6
+#| fig-cap: "Same per-sample view for the prophage structural module."
+
+ab |>
+  mutate(region = case_when(start > 2.103e6 & start < 2.125e6 ~ "prophage",
+                            start < 2.08e6 | start > 2.14e6   ~ "rest",
+                            TRUE ~ NA_character_)) |>
+  filter(!is.na(region)) |>
+  group_by(sample, genotype, medium, region) |>
+  summarise(md = median(normalized_abundance, na.rm = TRUE), .groups = "drop") |>
+  pivot_wider(names_from = region, values_from = md) |>
+  mutate(shift = prophage - rest) |>
+  ggplot(aes(medium, shift, colour = genotype)) +
+  geom_point(size = 2.5, position = position_dodge(width = 0.5)) +
+  scale_colour_manual(values = GENOTYPE_COLOURS) +
+  labs(y = "prophage minus rest (log2)", x = NULL,
+       title = "phiSa3 structural proteins are low in all 9 stp samples")
+```
+
+Again: all nine `stp` samples, all three media, no overlap with the other strains. But note
+the important difference to the block — these proteins are **still detected** in `stp`
+(`n_stp` is often 8 or 9 of 9), just 2–5× lower. So the phage is **not deleted** from the
+`stp` strain; it is **less active**.
+
+The most likely reading: in a growing *S. aureus* culture a small fraction of cells
+spontaneously induce their prophage (an SOS-type event) and lyse, and the phage structural
+proteins we see are the sum of that. A lower level in `stp` means **less spontaneous φSa3
+induction** in that strain. Whether that is a consequence of losing Stp1/Stk1 signalling or
+simply a property of this particular NTML isolate, we cannot tell from these data. A
+plaque/induction assay (± mitomycin C) would answer it directly.
+
+::: {.callout-note}
+## Keep remembering what the `stp` strain is
+Notebook 07 showed that `stp` (NE1919) has lost **both** Stp1 and — through a polar effect
+on the shared operon — most of Stk1. Every `stp` result in this notebook is a
+double-mutant result.
+:::
+
+## 4. Part C — the interaction contrasts
+
+Now the part that was the actual motivation. The hypothesis was: *if these regions matter,
+they should also show up in `interaction_stp_vs_anc_at_PASN_vs_TSB` and
+`interaction_stk_vs_anc_at_PASN_vs_TSB`.*
+
+In our tables those contrasts are named the other way around,
+`interaction_*_at_TSB_vs_SN` — same thing with the sign flipped:
+
+```{r int-explain}
+cat(explain_contrast("interaction_stk_vs_anc_at_TSB_vs_SN"))
+```
+
+Run exactly the same scan:
+
+```{r manhattan-int}
+#| fig-width: 11
+#| fig-height: 6
+#| fig-cap: "The same genomic scan on the two interaction contrasts."
+
+manhattan(dea, CONTRASTS_INT)
+```
+
+```{r int-scan}
+scans |>
+  filter(contrast %in% CONTRASTS_INT) |>
+  group_by(contrast) |>
+  summarise(threshold = round(first(threshold), 2),
+            `windows above threshold` = sum(is_peak), .groups = "drop")
+```
+
+### 4.1 The regions are gone — and that is the informative result
+
+```{r cancellation}
+dea |>
+  mutate(region = case_when(start > BLOCK[1] & start < BLOCK[2] ~ "stk block",
+                            start > 2.103e6 & start < 2.125e6   ~ "phiSa3 module",
+                            TRUE ~ "rest of genome")) |>
+  filter(contrast %in% c("stk_vs_anc_at_TSB", "stk_vs_anc_at_SNpulse", "stk_vs_anc_at_SN",
+                         "stp_vs_anc_at_TSB", "stp_vs_anc_at_SNpulse", "stp_vs_anc_at_SN",
+                         CONTRASTS_INT)) |>
+  group_by(contrast, region) |>
+  summarise(median_diff = round(median(diff), 2), .groups = "drop") |>
+  pivot_wider(names_from = region, values_from = median_diff) |>
+  select(contrast, `stk block`, `phiSa3 module`, `rest of genome`)
+```
+
+Read that table top to bottom. The `stk` block is at +0.72 / +0.66 / +0.72 in the three
+media — and at **−0.07 and +0.03** in the two interaction contrasts. It is gone.
+
+The φSa3 module is a more honest, messier case: it is down in `stp` in all three media
+(−0.45 / −0.18 / −0.37) but **not equally**, so a residue of about −0.26 survives into the
+interaction. That residue is real and it is why a couple of phage proteins still appear in
+the interaction hit list. Mostly constitutive, partly not.
+
+This is not a failure of the idea; it is the **arithmetic of an interaction contrast
+working as designed**. An interaction is a difference of differences. Anything that is
+constant between media — a gene dosage difference, a prophage that is equally quiet in all
+media, a strain background effect — cancels exactly:
+
+$$(\text{stk}-\text{anc})_{\text{TSB}} - (\text{stk}-\text{anc})_{\text{SN}} = 0 \quad \text{if the offset is the same in both media}$$
+
+::: {.callout-tip}
+## The methodological punchline for the group
+Your two peaks are real, reproducible, and they are **strain** differences rather than
+**signalling** differences. The interaction contrast is the right tool to tell those apart,
+because it is blind to anything constitutive. So the answer to "should these regions also
+come out in the interaction?" is **no, and the fact that they don't is the evidence that
+they are genomic**. Use the interaction contrasts as the clean read-out of
+"what do the mutants *do differently* in PASN".
+:::
+
+### 4.2 What *does* come out of the interaction contrasts
+
+```{r int-hits}
+int_hits <- dea |>
+  filter(contrast %in% CONTRASTS_INT, FDR < FDR_CUTOFF, abs(diff) > LFC_CUTOFF)
+
+int_hits |>
+  count(contrast, direction = if_else(diff > 0, "larger gap in TSB", "larger gap in SN"))
+```
+
+```{r int-top}
+int_hits |>
+  filter(estimate_type == "observed") |>
+  group_by(contrast) |>
+  slice_max(abs(diff), n = 12) |>
+  transmute(contrast, locus_tag, gene, start_Mb = round(start / 1e6, 2),
+            diff = round(diff, 2), FDR = signif(FDR, 2),
+            protein = substr(coalesce(up_protein_name, product), 1, 40)) |>
+  arrange(contrast, desc(abs(diff)))
+```
+
+Ranking by raw magnitude is not very informative here: the most extreme values belong to
+proteins with thin coverage, where one group mean rests on one or two measurements. The
+pattern only becomes visible when you stop looking at the top 12 and ask what the 157 hit proteins
+have in common — which is what STRING does in part D. One thing worth noting already is
+that iron- and haem-related proteins keep appearing:
+
+```{r iron-hits}
+int_hits |>
+  filter(str_detect(coalesce(up_protein_name, product),
+                    regex("iron|heme|hemin|siderophore|staphyloferrin", ignore_case = TRUE))) |>
+  transmute(contrast = str_remove(contrast, "^interaction_"), locus_tag, gene,
+            diff = round(diff, 2), FDR = signif(FDR, 2),
+            protein = substr(up_protein_name, 1, 44)) |>
+  arrange(gene)
+```
+
+### 4.3 One case study, done properly: the *kdp* operon
+
+`kdp` is the strongest single hit in `interaction_stk_vs_anc_at_TSB_vs_SN`
+(`kdpB` diff = +5.3). Before believing a number that large, look at the raw values —
+`CLAUDE.md` rule 4.
+
+```{r kdp-raw}
+#| fig-width: 10
+#| fig-height: 5
+#| fig-cap: "Per-sample normalised abundances for the kdp operon. Each point is one sample."
+plot_protein(c("B7H15_11530", "B7H15_11535", "B7H15_11540", "B7H15_11550", "B7H15_11555"), ab)
+```
+
+```{r kdp-n}
+ab |>
+  filter(locus_tag %in% c("B7H15_11530", "B7H15_11535", "B7H15_11540",
+                          "B7H15_11550", "B7H15_11555")) |>
+  group_by(locus_tag, genotype, medium) |>
+  summarise(n_detected = sum(!is.na(normalized_abundance)), .groups = "drop") |>
+  pivot_wider(names_from = c(genotype, medium), values_from = n_detected) |>
+  inner_join(select(meta, locus_tag, gene), by = "locus_tag") |>
+  relocate(gene, .after = locus_tag)
+```
+
+Read the counts: in **TSB** and **SNpulse** every group has 3 of 3, and there `kdp` is
+cleanly up in `stk` by ~2 log2 (4×). In **SN**, detection collapses to 1–3 of 3 in most
+groups. The enormous interaction value is therefore mostly driven by the *SN* side, where
+it rests on one or two measurements per group.
+
+**So the honest statement is:** `kdp` is solidly elevated in `stk` in TSB and SNpulse;
+whether it genuinely inverts in SN is not established by these data. And note the
+confounder from part B — `kdp` sits **inside the amplified block**, so part of its baseline
+elevation is gene dosage. The block median is +0.7, the `kdp` effect is +2.2, so there is a
+real surplus on top of dosage, but the two cannot be separated with proteomics alone.
+
+KdpD/KdpE is a potassium-sensing two-component system that in *S. aureus* also regulates
+virulence genes (STRING annotation below). A two-component histidine kinase being
+differentially abundant in a Ser/Thr-kinase mutant is a nice link to the course's
+phospho-signalling theme — and a nice thing to check in the phospho data set.
+
+## 5. Part D — STRING: the extended network and enrichment
+
+We map our locus tags to STRING via the NCTC 8325 UniProt orthologs that ship in the
+metadata table (keeping only `ortholog_quality == "good"`), then use the STRING v12 REST
+API. Everything is cached under `data/derived/string_cache/`, so a second render does not
+hit the network.
+
+```{r string-helper}
+STRING_SPECIES <- 93061   # S. aureus NCTC 8325, the reference STRING genome
+CACHE <- file.path(REPO_ROOT, "data", "derived", "string_cache")
+dir.create(CACHE, showWarnings = FALSE, recursive = TRUE)
+
+string_api <- function(endpoint, params) {
+  key <- paste(names(params), unlist(params), collapse = "&")
+  f <- file.path(CACHE, paste0(endpoint, "_", substr(openssl::md5(key), 1, 16), ".tsv"))
+  if (file.exists(f)) return(read_tsv(f, show_col_types = FALSE))
+  res <- httr::POST(paste0("https://string-db.org/api/tsv/", endpoint),
+                    body = c(params, list(species = STRING_SPECIES,
+                                          caller_identity = "bio253_course")),
+                    encode = "form")
+  httr::stop_for_status(res)
+  x <- read_tsv(I(httr::content(res, "text", encoding = "UTF-8")), show_col_types = FALSE)
+  write_tsv(x, f)
+  x
+}
+```
+
+```{r string-map}
+# The background for any enrichment test must be "what we could have detected",
+# not "the whole genome".
+detected <- meta |>
+  filter(protein_key %in% dea$protein_key, ortholog_quality == "good", !is.na(uniprot_acc))
+
+mapped <- string_api("get_string_ids",
+                     list(identifiers = paste(unique(detected$uniprot_acc), collapse = "\r"),
+                          limit = 1, echo_query = 1)) |>
+  select(uniprot_acc = queryItem, string_id = stringId, string_name = preferredName) |>
+  distinct(uniprot_acc, .keep_all = TRUE)
+
+detected <- inner_join(detected, mapped, by = "uniprot_acc")
+
+tibble(step = c("proteins quantified", "with a good NCTC 8325 ortholog",
+                "mapped to a STRING identifier"),
+       n = c(n_distinct(dea$protein_key),
+             n_distinct(filter(meta, protein_key %in% dea$protein_key,
+                               ortholog_quality == "good", !is.na(uniprot_acc))$protein_key),
+             nrow(detected)))
+```
+
+### 5.1 Enrichment of the interaction hits
+
+```{r string-enrich}
+hit_nodes <- int_hits |> distinct(protein_key) |> inner_join(detected, by = "protein_key")
+
+enrich <- string_api("enrichment",
+                     list(identifiers = paste(hit_nodes$string_id, collapse = "\r"),
+                          background_string_identifiers = paste(detected$string_id, collapse = "\r")))
+
+# PMID terms are text-mining co-citation, not function -- drop them.
+enrich_fn <- enrich |> filter(category != "PMID", fdr < 0.05) |> arrange(fdr)
+
+enrich_fn |>
+  transmute(category, description = substr(description, 1, 46),
+            hits = number_of_genes, background = number_of_genes_in_background,
+            FDR = signif(fdr, 2),
+            genes = substr(preferredNames, 1, 46))
+```
+
+Against a properly chosen background the signature is narrow and very consistent:
+**secreted, signal-peptide-bearing, cell-wall-anchored and extracellular proteins**
+(21 of the 69 detected "Secreted" proteins are hits), plus **potassium transport**
+(`kdpA/B/C`, 3 of 3) and **branched-chain amino acid biosynthesis** (`ilvA/D`, `leuA/B`).
+
+::: {.callout-caution}
+## What the background does — and a claim I had to withdraw
+With the *whole genome* as background, this hit list also looks strongly "iron-enriched".
+With the **detected proteome** as background it does not: no iron or haem GO/KEGG term
+reaches FDR < 0.05. The Isd proteins are abundant, easily detected surface proteins, so
+they are over-represented in *any* list drawn from this data set. They are genuinely in
+the hit list (see §4.2) and they are worth following up — but "iron acquisition is
+enriched" is **not** supported once the background is right. This is the single most
+common way enrichment analysis misleads, and it is worth showing rather than hiding.
+:::
+
+So the defensible answer to "what do the mutants do differently on the proteome level in
+PASN" is: **the medium-dependent divergence is concentrated in the secreted and
+cell-surface compartment**, not in the cytoplasmic housekeeping machinery. Given that PASN
+is partly nutrient-depleted and full of *P. aeruginosa* exoproducts, a different
+re-tuning of the envelope and the secretome is a biologically sensible place for the two
+signalling mutants to differ from the wild type.
+
+```{r enrich-plot}
+#| fig-width: 9
+#| fig-height: 4.5
+#| fig-cap: "STRING enrichment of the interaction hits against the detected-proteome background (PMID text-mining terms excluded)."
+
+enrich_fn |>
+  slice_min(fdr, n = 12) |>
+  mutate(description = forcats::fct_reorder(substr(description, 1, 42), -log10(fdr))) |>
+  ggplot(aes(-log10(fdr), description, fill = category)) +
+  geom_col() +
+  scale_fill_brewer(palette = "Set2") +
+  labs(y = NULL, x = "-log10(FDR)", fill = NULL)
+```
+
+### 5.2 The extended network
+
+We ask STRING for the high-confidence interactions among our hits, and let it **add 15
+proteins of its own** that connect them — that is the "extended" part: proteins we did not
+find ourselves but that STRING says belong in the picture.
+
+```{r string-network}
+net <- string_api("network", list(identifiers = paste(hit_nodes$string_id, collapse = "\r"),
+                                  add_nodes = 15, required_score = 700))
+
+added <- setdiff(unique(c(net$preferredName_A, net$preferredName_B)), hit_nodes$string_name)
+tibble(edges = nrow(net),
+       nodes = n_distinct(c(net$preferredName_A, net$preferredName_B)),
+       `added by STRING` = length(added))
+added
+```
+
+`kdpE`, `leuC`, `leuD` and `ilvC` are among them — STRING completes the `kdp` two-component
+system and the branched-chain amino acid pathway that our hit list only sampled. That is
+the extended network earning its keep.
+
+```{r network-plot}
+#| fig-width: 10
+#| fig-height: 8
+#| fig-cap: "Extended STRING network (confidence >= 0.7) of the interaction hits. Colour = direction in the interaction contrasts; grey = added by STRING. Only components with at least 3 members are drawn."
+
+g <- igraph::graph_from_data_frame(
+  select(net, preferredName_A, preferredName_B, score), directed = FALSE) |>
+  # STRING reports every edge twice (A-B and B-A); keep one, keep the score
+  igraph::simplify(edge.attr.comb = list(score = "max"))
+
+# keep components of size >= 3 so the picture stays readable
+comp <- igraph::components(g)
+g <- igraph::induced_subgraph(g, which(comp$membership %in% which(comp$csize >= 3)))
+
+node_info <- int_hits |>
+  inner_join(detected, by = "protein_key") |>
+  group_by(string_name) |>
+  summarise(diff = diff[which.max(abs(diff))], .groups = "drop")
+
+set.seed(7)
+lay <- igraph::layout_with_fr(g)
+nodes <- tibble(name = igraph::V(g)$name, x = lay[, 1], y = lay[, 2]) |>
+  left_join(node_info, by = c("name" = "string_name"))
+
+edges <- igraph::as_data_frame(g, "edges") |>
+  left_join(select(nodes, name, x, y), by = c("from" = "name")) |>
+  left_join(select(nodes, name, xend = x, yend = y), by = c("to" = "name"))
+
+ggplot() +
+  geom_segment(data = edges, aes(x, y, xend = xend, yend = yend, alpha = score),
+               colour = "grey55", linewidth = 0.35) +
+  geom_point(data = nodes, aes(x, y, fill = diff), shape = 21, size = 4.2,
+             colour = "grey25", stroke = 0.3) +
+  ggrepel::geom_text_repel(data = nodes, aes(x, y, label = name), size = 2.9,
+                           max.overlaps = 40, segment.size = 0.2) +
+  scale_fill_gradient2(low = "#0072B2", mid = "grey92", high = "#D55E00",
+                       midpoint = 0, na.value = "grey80",
+                       name = "interaction\nlog2 FC") +
+  scale_alpha(range = c(0.25, 0.9), guide = "none") +
+  theme_void() +
+  theme(legend.position = "right")
+```
+
+The drawing is worth reading module by module. Four stand out:
+
+* **`kdpA/B/C/D/E`** — the complete potassium system, with `kdpE` supplied by STRING.
+* **`isdA`–`isdB`–`isdC`–`srtB`** — the haem-uptake surface module and its sortase.
+* a large **amino-acid / central-carbon module** around `ilvA/C/D`, `leuA/B/C/D`, `tdcB`,
+  `ldh1`, `pflA/B` — where STRING contributed `ilvC`, `leuC` and `leuD` to complete the
+  branched-chain pathway our hit list only sampled.
+* **`purC/F/M/S`** (purine biosynthesis) and a small **`argF`–`arcA`** arginine-catabolism
+  triangle, neither of which stood out in the enrichment table.
+
+Note what is *not* in the picture: most of the secreted proteins that drove the enrichment
+(`hly`, `sbi`, `splF`, `isaA`, the Ssl proteins) are singletons or pairs here and were
+dropped by the "components of ≥ 3" filter. Secreted virulence factors are co-regulated
+rather than physically interacting, so STRING's high-confidence edges do not connect them.
+**Enrichment and network tell you different things**, and here they genuinely disagree
+about what the headline is — worth keeping both.
+
+::: {.callout-caution}
+## What STRING is and is not
+STRING edges are mostly **predictions** — from genomic neighbourhood, co-occurrence,
+co-expression and text mining — not measured interactions in *this* experiment. Two
+proteins joined here need not touch each other. Use the network to generate hypotheses
+and to see modules, never as evidence that something physically binds. Also note we mapped
+through NCTC 8325 orthologs, so JE2-specific proteins (the whole φSa3 and SaPI content,
+for instance) are under-represented by construction.
+:::
+
+### 5.3 Clustering and cluster labels — straight from the API
+
+On the STRING website you can apply a clustering (k-means, MCL or Leiden) and switch on a
+*cluster name overlay*. **Both are available through the API**, which is not obvious,
+because they do not live on the `network` endpoint — they are parameters of the
+**network image** endpoint:
+
+| parameter | what it does |
+|---|---|
+| `network_clustering_algorithm` | `kmeans`, `MCL` or `leiden` (default: no clustering) |
+| `network_clustering_parameter_kmeans` | k-means: number of clusters (default 3) |
+| `network_clustering_parameter_mcl` | MCL: inflation; higher = more, smaller clusters (default 3) |
+| `network_clustering_parameter_leiden` | Leiden: resolution; higher = more, smaller clusters (default 1) |
+| `cluster_aware_layout` | lay the network out so each cluster forms its own group (0/1) |
+| `network_clustering_edge_visibility` | edges *between* clusters: `faded`, `dotted`, `solid`, `noshow` |
+| `show_cluster_names` | the overlay: names each cluster after its most characteristic functional terms (0/1) |
+| `cluster_name_size` | 1, 1.5, 2 … 6 (default grows with the picture width) |
+
+The important part for us is that the clustering is not only available as a *picture*.
+The **`network_image_url`** endpoint takes exactly the same parameters and returns, as
+TSV/JSON/XML, **one row per cluster**: its number, colour, size, the member proteins and —
+crucially — `clusterNames`, the same labels that the overlay draws. So you can have the
+clusters as *data*.
+
+```{r string-image-helper}
+# The image endpoints return bytes, not a table, so they need their own helper.
+# `endpoint` is "image/network" (PNG), "highres_image/network" or "svg/network".
+string_file <- function(endpoint, params, file) {
+  path <- file.path(CACHE, file)
+  if (!file.exists(path)) {
+    res <- httr::POST(paste0("https://string-db.org/api/", endpoint),
+                      body = c(params, list(species = STRING_SPECIES,
+                                            caller_identity = "bio253_course")),
+                      encode = "form")
+    httr::stop_for_status(res)
+    writeBin(httr::content(res, "raw"), path)
+  }
+  path
+}
+
+# One parameter set, used for BOTH the picture and the cluster table, so they match.
+cluster_params <- list(
+  identifiers                         = paste(hit_nodes$string_id, collapse = "\r"),
+  network_flavor                      = "confidence",
+  hide_disconnected_nodes             = 1,
+  network_clustering_algorithm        = "leiden",
+  network_clustering_parameter_leiden = 1.4,
+  cluster_aware_layout                = 1,
+  network_clustering_edge_visibility  = "faded",
+  show_cluster_names                  = 1,
+  cluster_name_size                   = 1
+)
+```
+
+```{r string-clusters}
+clusters <- string_api("network_image_url", cluster_params)
+
+clusters |>
+  transmute(cluster = clusterNumber, colour = clusterColor, n = proteinCount,
+            name = substr(clusterNames, 1, 60),
+            members = substr(preferredNames, 1, 52))
+```
+
+```{r string-cluster-image}
+#| fig-cap: "The same network, clustered with Leiden by STRING itself (resolution 1.4), laid out cluster-aware and labelled with STRING's own cluster names. This is the API reproducing what the website's Clusters panel does."
+knitr::include_graphics(string_file("image/network", cluster_params, "leiden_clustered_network.png"))
+```
+
+This is the same figure the website produces, and it is a better summary of the hit list
+than anything we drew by hand: STRING names the clusters after their most characteristic
+functional terms, and the names line up with the enrichment in §5.1 —
+**Peptidoglycan-anchor / NEAr transporter domain** (the Isd haem cluster),
+**Secreted**, **Potassium transport** (`kdp`), **Valine, leucine and isoleucine
+biosynthesis**, **De novo IMP biosynthesis**, **Nitrogen metabolism**,
+**Citrulline biosynthesis / arginine metabolism**, **Lipid degradation**.
+
+::: {.callout-note}
+## Two things worth knowing before you use this
+**The clustering depends on the confidence cut-off, sometimes a lot.** The figure above
+uses STRING's default score threshold. Re-run it with `required_score = 700` (the
+threshold we used in §5.2) and the large secreted/surface clusters fall apart into
+singletons, because the edges that hold them together are co-expression and text-mining
+links below 0.7 — exactly the point made in §5.2. Neither answer is wrong; they answer
+different questions. Report the threshold with the picture.
+
+**TSV drops the image URL.** In `json` format the first record also carries an `imageURL`
+field pointing at the rendered PNG (valid for six months); the `tsv` output has the cluster
+columns only. If you want the link rather than the bytes, ask for JSON.
+:::
+
+Two closing remarks on *which* network figure to use. STRING's clustered image knows the
+cluster structure and can name it, but it cannot show **our** measurements. The hand-drawn
+network in §5.2 colours every node by its interaction fold change, which is the thing we
+actually measured, but it has no cluster labels. They are complementary, and a report is
+usually better with both than with either alone.
+
+### 5.4 Putting our fold changes on STRING's own figure, as halos
+
+The clustered figure above is STRING's. It knows the clusters and names them, but it knows
+nothing about *our* experiment. The hand-drawn network in §5.2 knows our fold changes but
+has no cluster labels. We can have both — because the API also serves the network as
+**SVG**, and an SVG is text we can edit.
+
+The trick is that every node in STRING's SVG is a `<g>` element that carries its own
+identity and position as data attributes:
+
+```
+<g class='nwnodecontainer' data-safe_div_label='kdpB'
+   data-x_pos='394' data-y_pos='284' data-radius='20' id='node.14505777'>
+```
+
+So we can walk the nodes, look each one up in our DEA table, and inject coloured discs
+*behind* each node. And because we can inject more than one disc, we can show **two**
+contrasts at once: draw the larger disc first and the smaller one on top of it, and what
+is left visible is a pair of concentric rings. Outer ring = the `stk` interaction, inner
+ring = the `stp` interaction, node fill = STRING's cluster colour.
+
+That is worth doing here, because the two interaction contrasts are much less redundant
+than they look — most hit proteins are a hit in only one of them, which a single ring
+per node hides completely:
+
+```{r halo-overlap}
+int_hits |>
+  mutate(ring = if_else(str_detect(contrast, "stk"), "stk", "stp")) |>
+  distinct(protein_key, ring) |>
+  count(protein_key, name = "in_n_contrasts") |>
+  count(in_n_contrasts, name = "proteins")
+```
+
+```{r halo-params}
+# Same clustering as above; flat nodes keep the file ~20x smaller than the
+# default structure thumbnails, and make the halos easier to read.
+halo_params <- c(cluster_params,
+                 list(block_structure_pics_in_bubbles = 1, flat_node_design = 1))
+
+svg_text <- readLines(string_file("svg/network", halo_params, "leiden_flat_network.svg"),
+                      warn = FALSE) |>
+  paste(collapse = "\n")
+```
+
+```{r halo-values}
+# Two rings means two numbers per node. Note one deliberate difference from the
+# node colours in 5.2: nodes were *selected* by significance, but a ring is
+# coloured by the measured effect in that contrast whether or not it is
+# significant. Otherwise grey would mean two different things ("not measured"
+# and "measured, but not a hit"). Significance is shown by the ring outline instead.
+int_values <- dea |>
+  filter(contrast %in% CONTRASTS_INT) |>
+  inner_join(detected, by = "protein_key") |>
+  mutate(ring   = if_else(str_detect(contrast, "stk"), "stk", "stp"),
+         is_hit = FDR < FDR_CUTOFF & abs(diff) > LFC_CUTOFF) |>
+  group_by(string_name, ring) |>
+  slice_max(abs(diff), n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  select(string_name, ring, diff, is_hit)
+```
+
+```{r halo-build}
+LIMIT <- 4                                   # clip the colour scale at +/- 4 log2
+ramp <- colorRamp(c("#0072B2", "#F2F2F2", "#D55E00"))
+colour_of <- function(v) {
+  if (is.na(v)) return("#BFBFBF")            # STRING-added, or not measured here
+  t <- (max(min(v, LIMIT), -LIMIT) + LIMIT) / (2 * LIMIT)
+  rgb(ramp(t)[1], ramp(t)[2], ramp(t)[3], maxColorValue = 255)
+}
+
+# Outer ring first, inner ring second. Each disc paints over the middle of the
+# previous one, so two filled circles end up reading as two concentric rings.
+RINGS <- c(stk = 10, stp = 5)                # pixels added to the node radius
+
+node_tags <- regmatches(svg_text,
+                        gregexpr("<g class='nwnodecontainer'[^>]*>", svg_text))[[1]]
+attr_of <- function(tag, a) sub(paste0(".*", a, "='([^']*)'.*"), "\\1", tag)
+
+for (tag in node_tags) {
+  label <- attr_of(tag, "data-safe_div_label")
+  r0    <- as.numeric(attr_of(tag, "data-radius"))
+  discs <- vapply(names(RINGS), function(ring) {
+    i   <- match(paste(label, ring), paste(int_values$string_name, int_values$ring))
+    hit <- !is.na(i) && int_values$is_hit[i]
+    sprintf("<circle cx='%s' cy='%s' r='%.1f' fill='%s' stroke='%s' stroke-width='%.1f' />",
+            attr_of(tag, "data-x_pos"), attr_of(tag, "data-y_pos"), r0 + RINGS[[ring]],
+            colour_of(if (is.na(i)) NA_real_ else int_values$diff[i]),
+            if (hit) "rgb(30,30,30)" else "rgb(160,160,160)",
+            if (hit) 1.6 else 0.6)
+  }, character(1))
+  # inserted right after the opening tag, so both are painted BEHIND the node
+  svg_text <- sub(tag, paste0(tag, "\n", paste(discs, collapse = "\n")),
+                  svg_text, fixed = TRUE)
+}
+```
+
+```{r halo-coverage}
+labels_in_figure <- vapply(node_tags, attr_of, character(1), "data-safe_div_label")
+key <- paste(int_values$string_name, int_values$ring)
+
+tibble(ring        = c("outer: stk interaction", "inner: stp interaction"),
+       nodes_in_figure = length(node_tags),
+       measured    = c(sum(paste(labels_in_figure, "stk") %in% key),
+                       sum(paste(labels_in_figure, "stp") %in% key)),
+       a_hit       = c(sum(paste(labels_in_figure, "stk") %in% key[int_values$is_hit]),
+                       sum(paste(labels_in_figure, "stp") %in% key[int_values$is_hit])))
+```
+
+```{r halo-legend}
+# STRING's SVG has width/height but no viewBox. Read them, then add a strip at
+# the bottom for the legend and give the file a viewBox so it scales cleanly.
+wh <- as.numeric(c(sub(".*\\bwidth='([0-9]+)'.*",  "\\1", substr(svg_text, 1, 400)),
+                   sub(".*\\bheight='([0-9]+)'.*", "\\1", substr(svg_text, 1, 400))))
+LEGEND_H <- 160
+
+legend_svg <- paste0(
+  # the colour bar
+  paste(vapply(0:59, function(i) {
+    v <- -LIMIT + 2 * LIMIT * i / 59
+    sprintf("<rect x='%.1f' y='34' width='3.3' height='14' fill='%s' />",
+            20 + i * 3.2, colour_of(v))
+  }, character(1)), collapse = ""),
+  "<rect x='20' y='34' width='192' height='14' fill='none' stroke='rgb(80,80,80)' stroke-width='0.7'/>",
+  "<text x='116' y='26' font-size='13' text-anchor='middle'>interaction log2 fold change</text>",
+  sprintf("<text x='20'  y='64' font-size='13'>-%d</text>", LIMIT),
+  sprintf("<text x='212' y='64' font-size='13' text-anchor='end'>+%d</text>", LIMIT),
+  # a schematic node: outer ring, inner ring, node fill
+  "<circle cx='300' cy='60' r='30' fill='#D55E00' stroke='rgb(30,30,30)' stroke-width='1.6'/>",
+  "<circle cx='300' cy='60' r='20' fill='#0072B2' stroke='rgb(30,30,30)' stroke-width='1.6'/>",
+  "<circle cx='300' cy='60' r='11' fill='#9fcf9f' stroke='rgb(70,70,70)' stroke-width='0.8'/>",
+  "<text x='346' y='36' font-size='13'>outer ring = interaction_stk_vs_anc_at_TSB_vs_SN</text>",
+  "<text x='346' y='58' font-size='13'>inner ring = interaction_stp_vs_anc_at_TSB_vs_SN</text>",
+  "<text x='346' y='80' font-size='13'>node fill   = STRING cluster colour</text>",
+  # what the ring outline means
+  "<text x='346' y='104' font-size='13'>thick dark outline = FDR &lt; 0.1 and |log2FC| &gt; 1 in that contrast</text>",
+  "<text x='346' y='126' font-size='13'>thin pale outline  = measured, but not a hit in that contrast</text>")
+
+svg_text <- sub("</svg>\\s*$",
+                sprintf("<g id='halo-legend' transform='translate(0,%d)'>%s</g></svg>",
+                        wh[2], legend_svg),
+                svg_text)
+svg_text <- sub("height='[0-9]+'", sprintf("height='%d'", wh[2] + LEGEND_H), svg_text)
+svg_text <- sub("<svg ", sprintf("<svg viewBox='0 0 %d %d' ", wh[1], wh[2] + LEGEND_H),
+                svg_text)
+```
+
+```{r halo-show}
+#| fig-cap: "STRING's Leiden clusters and cluster names, with both interaction contrasts added as halos. Node fill = cluster colour; outer ring = stk interaction; inner ring = stp interaction; thick dark outline = a hit in that contrast."
+# Write the edited SVG and let Quarto embed it. (Pasting the SVG inline into the
+# HTML also works, but pandoc lower-cases `viewBox`, which SVG then ignores.)
+halo_svg <- file.path(CACHE, "leiden_flat_network_halos.svg")
+writeLines(svg_text, halo_svg)
+knitr::include_graphics(halo_svg)
+```
+
+Read each node from the inside out: STRING's cluster colour, then the `stp` interaction,
+then the `stk` interaction. Three patterns are now visible that one ring could not show.
+
+* **The potassium cluster is almost purely a `stk` effect.** `kdpB` and `kdpD` have an
+  outer ring at the top of the scale (+5.3 and +5.1, FDR 0.083 and 2.2e-07) and an inner
+  ring that is essentially white (+0.07 and +0.60, both far from significant). Only `kdpC`
+  is a hit in both. Whatever the `kdp` system is doing, it tracks the loss of the kinase,
+  not the loss of the phosphatase.
+* **Branched-chain amino acid biosynthesis leans the same way, but not exclusively.**
+  `ilvA` is strongly up in both (+3.01 and +2.32, both FDR < 0.002); `leuA`, `leuB` and
+  `ilvD` are `stk`-only. So the cluster is orange on the outside and mixed on the inside.
+* **The haem genes split, and in opposite directions.** `hrtA` is one of the strongest
+  `stp` results in the whole table (-4.98, FDR 0.014) while its `stk` ring is blank
+  (+0.70, FDR 0.84); its operon partner `hrtB` does the reverse (+2.83, FDR 0.076 in
+  `stk`; +0.36, FDR 0.86 in `stp`). Two subunits of one transporter pointing opposite ways
+  in two contrasts is a warning sign, not a finding — check `plot_protein()` for both
+  before building any story on it.
+
+::: {.callout-warning}
+## A correction to what I wrote under the one-ring version
+With a single ring per node I took, for each protein, the interaction contrast with the
+larger |log2FC| — and then described `hrtA` and `hrtB` as "ringed in deep blue". That was
+wrong: only `hrtA` was blue, `hrtB` was orange, because they came from *different*
+contrasts. That is exactly the failure mode the second ring removes. A one-number-per-node
+summary over two contrasts is convenient and quietly mixes sources; if you reduce two
+contrasts to one colour, say in the caption which contrast each node came from, or do not
+reduce them.
+:::
+
+::: {.callout-tip}
+## Why this is worth the twenty lines of string manipulation
+Any overlay you can compute — fold change, FDR, phospho-site count, presence/absence,
+how often a protein shows up across contrasts — can be painted onto STRING's own layout
+this way, because the SVG keeps the node identity and coordinates in the markup. You get
+STRING's clustering and labels *and* your data in one figure, without reimplementing
+either. `RINGS` is the whole control: drop an entry for a single ring, add one (with a
+larger offset, listed first) for a third contrast. Past three the rings get thin — at that
+point use a small pie or a bar glyph per node instead, which is the same injection trick
+with a different shape.
+:::
+
+## 6. Part E — does the phospho layer agree?
+
+The total proteome says *how much* protein there is. The phospho-enriched samples say
+something the total proteome cannot: whether a protein is **modified**. Three questions:
+
+1. Does the phospho data independently confirm the `stk` amplification? (**yes**)
+2. Do the interaction hits carry phospho-sites that move? (**no — coverage is too thin**)
+3. Does the phospho layer have an interaction signal of its own? (**yes, a different one**)
+
+### 6.0 First, an honest coverage check
+
+```{r phospho-coverage}
+sites <- read_sites("STYH")
+
+site_detection <- sites |>
+  group_by(site_id, protein_key, locus_tag, residue, position) |>
+  summarise(n_det = sum(!is.na(intensity)), .groups = "drop")
+
+tibble(
+  what = c("sites in the table", "proteins carrying them",
+           "sites detected in >= 9 of 27 samples", "sites detected in >= 18 of 27",
+           "sites seen in exactly ONE sample",
+           "rows of the phospho DEA that are LOD-imputed (%)"),
+  n = c(n_distinct(site_detection$site_id),
+        n_distinct(site_detection$protein_key),
+        sum(site_detection$n_det >= 9),
+        sum(site_detection$n_det >= 18),
+        sum(site_detection$n_det == 1),
+        round(100 * mean(read_dea("phospho_STYH")$estimate_type == "lod_imputed")))
+)
+```
+
+::: {.callout-warning}
+## Read this before any phospho conclusion
+Of 4,245 sites, **only 565 are detected in at least a third of the samples**, and 1,865 are
+one-hit wonders. **96 % of the phospho DEA rows are LOD-imputed**, i.e. presence/absence
+rather than a measured fold change. Everything below is therefore restricted to the 565
+well-detected sites, and imputed estimates are always flagged. With n = 3 and this much
+missingness, the phospho layer can *support* a hypothesis and can give strong
+presence/absence evidence — it cannot deliver precise fold changes.
+:::
+
+### 6.1 The amplified block, seen a second time
+
+The phospho samples were enriched and measured separately, so they are an independent
+look. Site intensities come straight from FragPipe and are *not* cross-run normalised, so
+we median-centre each sample first, then compare each site's mean in `stk` against `anc`.
+
+```{r phospho-block}
+site_norm <- sites |>
+  group_by(sample) |>
+  # FragPipe intensities are not normalised across runs; centre each run first.
+  mutate(norm = log2_intensity - median(log2_intensity, na.rm = TRUE)) |>
+  ungroup() |>
+  inner_join(select(meta, protein_key, start), by = "protein_key")
+
+site_geno <- site_norm |>
+  filter(!is.na(norm)) |>
+  group_by(site_id, protein_key, start, genotype) |>
+  summarise(mu = mean(norm), n = n(), .groups = "drop") |>
+  filter(n >= 2) |>                      # at least 2 of 3 replicates in that genotype
+  select(-n) |>
+  pivot_wider(names_from = genotype, values_from = mu) |>
+  filter(!is.na(anc), !is.na(stk)) |>
+  mutate(stk_minus_anc = stk - anc,
+         region = if_else(start > BLOCK[1] & start < BLOCK[2], "block", "rest"))
+
+site_geno |>
+  group_by(region) |>
+  summarise(sites = n(),
+            `median stk - anc` = round(median(stk_minus_anc), 2),
+            `fold change` = round(2^median(stk_minus_anc), 2), .groups = "drop")
+```
+
+```{r phospho-block-test}
+wilcox.test(stk_minus_anc ~ region, data = site_geno)
+```
+
+```{r phospho-block-plot}
+#| fig-width: 8
+#| fig-height: 3.4
+#| fig-cap: "Per-site stk-vs-anc difference, sites inside the amplified block vs the rest. Independent measurement, same conclusion."
+
+ggplot(site_geno, aes(stk_minus_anc, region, fill = region)) +
+  geom_vline(xintercept = 0, colour = "grey60") +
+  geom_boxplot(width = 0.5, outlier.size = 0.7) +
+  scale_fill_manual(values = c(block = "#D55E00", rest = "grey80"), guide = "none") +
+  labs(x = "phospho-site log2 difference, stk minus anc", y = NULL)
+```
+
+The 50 well-covered sites inside the block sit **+0.45 log2 (1.36x)** above the `anc`
+samples, against **+0.04** for the 728 sites elsewhere. This is a different sample
+preparation, a different enrichment chemistry and a different normalisation, and it
+reproduces the block. Combined with the sharp *rrn* boundaries and the presence in all 9
+`stk` samples, the amplification hypothesis is now considerably better supported.
+
+(The shift is smaller than the +0.72 seen on proteins. Do not over-read that — site
+intensity is protein abundance × occupancy, the dynamic range of the enriched samples is
+different, and 50 sites is not many. The direction and the contrast with the rest of the
+genome are the result; the exact number is not.)
+
+### 6.2 The interaction hits: coverage is simply not there
+
+Now the question that motivated this section — do the 157 interaction-hit proteins carry
+sites that move in the same comparisons?
+
+```{r phospho-hits}
+hit_proteins <- int_hits |> distinct(protein_key)
+
+tibble(
+  what = c("interaction hit proteins (total proteome)",
+           "of those, with ANY phospho-site in the table",
+           "of those, with a site detected in >= 9 of 27 samples"),
+  n = c(nrow(hit_proteins),
+        n_distinct(site_detection$protein_key[site_detection$protein_key %in% hit_proteins$protein_key]),
+        n_distinct(site_detection$protein_key[site_detection$protein_key %in% hit_proteins$protein_key &
+                                              site_detection$n_det >= 9]))
+)
+```
+
+Fifteen proteins out of 157. And for those fifteen, the site-level interaction estimates
+are almost all non-significant or imputed:
+
+```{r phospho-hits-detail}
+well_covered <- site_detection |> filter(n_det >= 9)
+
+site_vs_protein <- read_dea("phospho_STYH", contrasts = CONTRASTS_INT) |>
+  filter(site_id %in% well_covered$site_id) |>
+  select(site_id, protein_key, contrast, site_diff = diff,
+         site_FDR = FDR, site_type = estimate_type) |>
+  inner_join(select(int_hits, protein_key, contrast, prot_diff = diff),
+             by = c("protein_key", "contrast")) |>
+  inner_join(select(meta, protein_key, gene, up_protein_name), by = "protein_key")
+
+site_vs_protein |>
+  transmute(contrast = str_remove(contrast, "^interaction_"),
+            gene, site = str_extract(site_id, "[STYH]\\d+$"),
+            site_diff = round(site_diff, 2), site_FDR = signif(site_FDR, 2), site_type,
+            prot_diff = round(prot_diff, 2),
+            protein = substr(up_protein_name, 1, 30)) |>
+  arrange(site_FDR) |>
+  head(10)
+```
+
+**So the answer to the original question is no.** The secreted / cell-surface signature
+from §5.1 cannot be followed into the phospho data, because secreted and wall-anchored
+proteins are poorly represented among the detected phospho-sites in the first place. This
+is a limitation of the data, not evidence that those proteins are unphosphorylated.
+
+### 6.3 The phospho layer has its own, different interaction signal
+
+Asking the phospho data directly — without going through the total-proteome hit list —
+does give results:
+
+```{r phospho-own}
+phospho_int <- read_dea("phospho_STYH", contrasts = CONTRASTS_INT) |>
+  filter(site_id %in% well_covered$site_id)
+
+phospho_int |>
+  group_by(contrast) |>
+  summarise(`well-covered sites tested` = n(),
+            `observed (not imputed)` = sum(estimate_type == "observed"),
+            `FDR < 0.1 and |diff| > 1` = sum(FDR < FDR_CUTOFF & abs(diff) > LFC_CUTOFF),
+            .groups = "drop")
+```
+
+```{r phospho-own-list}
+phospho_sig <- phospho_int |>
+  filter(FDR < FDR_CUTOFF, abs(diff) > LFC_CUTOFF) |>
+  left_join(select(well_covered, site_id, n_det), by = "site_id") |>
+  left_join(select(meta, protein_key, gene, up_protein_name), by = "protein_key") |>
+  left_join(select(int_hits, protein_key, contrast, prot_diff = diff),
+            by = c("protein_key", "contrast"))
+
+phospho_sig |>
+  transmute(contrast = str_remove(contrast, "^interaction_"), gene,
+            site = str_extract(site_id, "[STYH]\\d+$"), n_det,
+            diff = round(diff, 2), estimate_type, FDR = signif(FDR, 2),
+            protein = substr(up_protein_name, 1, 34)) |>
+  arrange(contrast, desc(abs(diff)))
+```
+
+Two things stand out.
+
+**First, these are mostly central carbon and energy metabolism enzymes** — pyruvate kinase
+(`pyk`), enolase (`eno`), glucose-6-phosphate isomerase (`pgi`), the glucose PTS
+transporter (`ptsG`), carbamoyl-phosphate synthase (`carB`), dihydroorotase (`pyrC`),
+urease (`ureC`), ribosomal protein `rplR`. For almost all of them the **protein level is
+flat** in the same contrast, so if these changes are real they are genuine changes in
+phosphorylation, not in abundance. That is exactly the kind of result the phospho layer
+exists to provide.
+
+**Second, almost none of them overlap the total-proteome hits:**
+
+```{r phospho-overlap}
+tibble(
+  what = c("proteins with a significant interaction SITE",
+           "of those, also total-proteome interaction hits"),
+  n = c(n_distinct(phospho_sig$protein_key),
+        sum(unique(phospho_sig$protein_key) %in% hit_proteins$protein_key))
+)
+```
+
+The protein-level and site-level interaction signals are **largely orthogonal**. That is
+not a contradiction — changing how much of an enzyme you make and changing whether it is
+phosphorylated are different regulatory moves.
+
+::: {.callout-important}
+## The large caveat on §6.3
+Look at the `estimate_type` column: nearly every one of these is `lod_imputed`. These are
+**presence/absence** calls — the site was found in one genotype×medium combination and not
+in another — which is why the fold changes are so extreme (+4 to +10 log2). With n = 3,
+presence/absence can arise from a single missed identification. Treat this table as a
+**candidate list to verify**, not as a result. Verifying it means targeted PRM/MRM on those
+specific peptides.
+:::
+
+### 6.4 The one result that needs no caveat: ReoM Thr7
+
+While looking through the significant sites, one protein stands out — and it is the best
+single result in this whole notebook.
+
+```{r reom}
+sites |>
+  filter(locus_tag == "B7H15_08845") |>
+  group_by(site = str_extract(site_id, "[STYH]\\d+$"), genotype, medium) |>
+  summarise(n_detected = sum(!is.na(intensity)),
+            mean_log2 = round(mean(log2_intensity, na.rm = TRUE), 1), .groups = "drop") |>
+  mutate(value = if_else(n_detected == 0, "not detected",
+                         paste0(mean_log2, " (", n_detected, "/3)"))) |>
+  select(-n_detected, -mean_log2) |>
+  pivot_wider(names_from = c(genotype, medium), values_from = value)
+```
+
+```{r reom-protein}
+# Is the PROTEIN also missing in stk? (If it were, this would be trivial.)
+read_abundances("total") |>
+  filter(locus_tag == "B7H15_08845") |>
+  group_by(genotype) |>
+  summarise(n_detected = sum(!is.na(normalized_abundance)),
+            mean_log2 = round(mean(normalized_abundance, na.rm = TRUE), 2), .groups = "drop")
+```
+
+`B7H15_08845` is **ReoM** (NCTC 8325 ortholog Q2FXW0, `reoM`, "peptidoglycan synthesis
+regulatory protein"). The phospho-site at **Thr7** is detected in **3 of 3 samples of every
+single `anc` and `stp` group**, in all three media — and in **0 of 9 `stk` samples**. The
+ReoM *protein* is present at the same level in all three strains (15.8 / 15.9 / 15.1). So
+this is not a missing protein; it is a **missing modification**.
+
+```{r reom-plot}
+#| fig-width: 9
+#| fig-height: 3.6
+#| fig-cap: "ReoM Thr7 phospho-site intensity per sample. Absent from every stk sample; unaffected in stp."
+
+sites |>
+  filter(locus_tag == "B7H15_08845", str_detect(site_id, "_T7$")) |>
+  ggplot(aes(medium, log2_intensity, colour = genotype)) +
+  geom_point(size = 2.6, position = position_dodge(width = 0.5)) +
+  scale_colour_manual(values = GENOTYPE_COLOURS) +
+  labs(y = "log2 intensity of pThr7", x = NULL,
+       caption = "stk has no point in any medium: the site is not detected there")
+```
+
+Why this matters:
+
+* **ReoM Thr7 is the conserved PASTA-kinase site.** In *Listeria monocytogenes* PrkA
+  phosphorylates ReoM at Thr7, and phospho-ReoM protects MurA — the first enzyme of
+  peptidoglycan synthesis — from ClpCP-dependent degradation
+  ([Wamp et al. 2020, eLife 9:e56048](https://doi.org/10.7554/eLife.56048)). The same
+  Stk–ReoM–MurA axis has been described in *S. aureus*
+  ([Hammond et al. 2025, PMC13692261](https://pmc.ncbi.nlm.nih.gov/articles/PMC13692261)).
+* **This is a positive control that the whole experiment worked.** The kinase mutant has
+  lost phosphorylation of a known PASTA-kinase substrate, completely and reproducibly, at
+  a site localised with probability 1.0. If you doubted whether the Fe-IMAC enrichment and
+  the STYH search were giving real biology, this settles it.
+* **It says something new about the `stp` strain.** Notebook 07 showed `stp` has lost most
+  of its Stk1 protein through the polar effect — here that is a 16-fold reduction
+  (12.5 vs 16.6 log2). And yet **ReoM Thr7 is fully phosphorylated in `stp`**, in every
+  medium. Residual Stk1, with no Stp1 left to remove the mark, is evidently enough to
+  saturate this site. The kinase/phosphatase *balance*, not the kinase amount, sets the
+  outcome — which is the central idea of the course topic, visible in one row of data.
+
+```{r reom-caveats}
+# T7 and Y12 sit on the SAME tryptic peptide -- they are not independent observations.
+sites |>
+  filter(locus_tag == "B7H15_08845") |>
+  distinct(site_id, residue, position, peptide, best_loc_prob) |>
+  mutate(peptide = substr(peptide, 1, 44))
+```
+
+Two honest caveats. The neighbouring **Tyr12** site behaves identically, but it sits on the
+*same tryptic peptide*, so T7 and Y12 are one observation, not two. And in the
+**interaction** contrast ReoM T7 is not significant at all (FDR = 1.0) — because the loss
+is constitutive, identical in all three media. Exactly like the genomic blocks in §4.1, the
+clearest signalling result in the data set is invisible to an interaction contrast. That is
+the same lesson for the third time, and it is worth internalising.
+
+### 6.5 The obvious follow-up prediction, and why it fails here
+
+If ReoM is unphosphorylated in `stk`, ClpCP should degrade MurA, so **MurA should be lower
+in `stk`**. Test it:
+
+```{r mura}
+dea |>
+  filter(contrast %in% c("stk_vs_anc_at_TSB", "stp_vs_anc_at_TSB"),
+         locus_tag %in% c("B7H15_11665", "B7H15_11795")) |>
+  transmute(contrast, locus_tag, gene, start_Mb = round(start / 1e6, 3),
+            diff = round(diff, 2), FDR = signif(FDR, 2)) |>
+  arrange(contrast)
+```
+
+MurA is **up** in `stk`, by +0.89 and +0.61 — which is simply the block median (+0.72).
+And there is the problem: **both MurA/MurZ paralogues sit inside the amplified block**. Gene
+dosage pushes MurA up, the ReoM model pushes it down, and with one measurement we cannot
+separate the two. So this prediction is not testable in this data set — another reason the
+genome sequencing in the next steps is not optional.
+
+## 7. Where this leaves the group
+
+**What held up.** The genomic-position idea is good and the two peaks are real and
+reproducible — far more reproducible than a typical single-protein hit, because they rest
+on dozens of neighbouring proteins at once.
+
+**What changed.** The two peaks are most likely not about Stk1/Stp1 signalling at all:
+
+| region | what it is | evidence | medium-dependent? |
+|---|---|---|---|
+| 2.183–2.291 Mb, up in `stk` | ~107 kb tandem amplification between two *rRNA* operons; contains *sigB*, *atp*, *kdp* | uniform 1.65× over 94 proteins, sharp *rrn* boundaries, all 9 `stk` samples | no — cancels in the interaction |
+| 2.103–2.125 Mb, down in `stp` | φSa3 prophage structural module (phage is inserted in *hlb*) | still detected but 2–5× lower, all 9 `stp` samples | mostly not |
+
+So the group's question — "how can these regulated proteins be connected to the transposon
+mutants?" — has a provocative answer: **possibly not through the transposon at all**, but
+through what else is different about these two NTML isolates.
+
+**What the phospho layer added.** The phospho samples confirm the `stk` block
+independently (§6.1), which is the strongest evidence we have that it is genomic. They
+*cannot* follow the secreted/surface signature — only 15 of the 157 hit proteins have a
+well-covered site (§6.2). But they carry an interaction signal of their own, on central
+carbon metabolism enzymes whose protein levels are flat (§6.3), and they deliver one
+unambiguous result: **ReoM Thr7 is phosphorylated in every `anc` and `stp` sample and in no
+`stk` sample**, with ReoM protein equally abundant in all three strains (§6.4). That is a
+known PASTA-kinase substrate behaving exactly as it should, which validates the experiment
+— and it shows the `stp` strain keeps this site fully phosphorylated despite having 16-fold
+less Stk1, i.e. the kinase/phosphatase *balance* is what matters.
+
+**What is genuinely new from the interaction contrasts.** Once the constitutive strain
+differences are removed, what remains is a **secretome / cell-surface**
+signature: the mutants and the wild type re-tune their envelope and secreted proteins
+differently when they meet PASN. Several iron- and haem-acquisition proteins sit in that
+list (`isdA/B/C`, `sbnA/H`, `hrtB`), but note §5.1 — iron is *not* a statistically
+enriched category once the detected proteome is used as the background.
+
+### Concrete next steps
+
+1. **Sequence the three strains.** One cheap Illumina run tests the amplification directly
+   and checks for other secondary mutations. This is the single highest-value experiment
+   this analysis suggests.
+2. **Check σ^B^ activity**, since *sigB* sits inside the block: are known σ^B^-regulon
+   proteins (e.g. *asp23*, pigment) shifted in `stk` across all media?
+3. **Test φSa3 induction** in `stp` directly (± mitomycin C, plaque or qPCR on phage DNA).
+4. **Verify the §6.3 candidate sites by targeted MS** (PRM/MRM on the `pyk`, `eno`,
+   `pgi`, `ptsG` peptides). They are presence/absence calls today; targeted runs would turn
+   them into real measurements, and they are the only interaction-specific *signalling*
+   leads we have.
+5. **Follow up ReoM properly.** The Stk1-dependence of Thr7 is established here beyond
+   reasonable doubt (§6.4). The interesting open question is why `stp` — with 16-fold less
+   Stk1 — keeps the site fully phosphorylated. A phosphatase-dead `stp` complement, or
+   simply blotting phospho-ReoM across the three strains, would answer it.
+6. **Re-plot the scan per medium** (`*_at_SN`, `*_at_SNpulse`) as a control — the block
+   must be there in all three, and it is; that is already in §3.1.
+
+A first look at step 2, since it costs two lines. Asp23 (alkaline shock protein 23) is the
+classic σ^B^ reporter in *S. aureus*, and conveniently it sits at 2.320 Mb — **outside**
+the amplified block, so its own gene dosage is normal:
+
+```{r asp23}
+#| fig-width: 9
+#| fig-height: 3.6
+#| fig-cap: "Asp23 and its membrane anchor AmaP, the classic sigma-B reporters, per sample."
+plot_protein(c("B7H15_12150", "B7H15_12160"), ab)
+```
+
+```{r asp23-diffs}
+dea |>
+  filter(locus_tag %in% c("B7H15_12150", "B7H15_12160"),
+         contrast %in% c("stk_vs_anc_at_TSB", "stk_vs_anc_at_SNpulse", "stk_vs_anc_at_SN",
+                         "stp_vs_anc_at_TSB", "stp_vs_anc_at_SNpulse", "stp_vs_anc_at_SN")) |>
+  transmute(locus_tag, gene, contrast, diff = round(diff, 2), FDR = signif(FDR, 2)) |>
+  pivot_wider(names_from = contrast, values_from = c(diff, FDR)) |>
+  select(locus_tag, gene, starts_with("diff"))
+```
+
+Two separate results here:
+
+* In **`stk`**, Asp23 is flat (|log2 FC| ≤ 0.18 in all three media) and so is AmaP. So
+  there is **no evidence of a globally raised σ^B^ output**, despite the extra *sigB* copy.
+  That is a useful negative: an extra gene copy is not the same as more active sigma
+  factor — σ^B^ is controlled post-translationally by the RsbU/RsbV/RsbW partner switch,
+  and those genes are duplicated along with it, so the stoichiometry may simply be
+  preserved.
+* In **`stp`**, both Asp23 and AmaP are **down by 0.4–0.6 log2 in every medium**, with very
+  small FDRs. The effect is modest but it is the most consistent σ^B^-reporter signal in
+  the data, and it is in the strain that lacks both Stp1 and most of Stk1. Worth a proper
+  look with more σ^B^ regulon members — a small, genuinely signalling-flavoured lead that
+  the two big genomic blocks were drowning out.
+
+```{r session}
+sessionInfo()
+```
