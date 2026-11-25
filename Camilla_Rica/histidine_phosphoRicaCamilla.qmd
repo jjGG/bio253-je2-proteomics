@@ -1,0 +1,1381 @@
+---
+title: "05 – Does S. aureus phosphorylate histidine?"
+subtitle: "Bio253 HS2026 · STY vs STYH search, judged conservatively"
+---
+
+**Claim to test:** Prust *et al.* 2021 (*Mol Cell Proteomics* 20:100034) report that
+~8 % of all *S. aureus* phospho-sites are on **histidine** (pHis). Can we see pHis
+in our data – and how sure can we be?
+
+The raw files were searched twice:
+
+* **STY** – phosphorylation allowed on Ser, Thr, Tyr
+* **STYH** – additionally on His
+
+::: {.callout-important}
+## Be sceptical – on purpose
+* pHis is **acid-labile**. Our workflow (Fe-IMAC enrichment, acidic LC) is not
+  pHis-friendly, so many pHis may be lost – and the ones we "see" need extra scrutiny.
+* The main source of false pHis is **mis-localisation**: if a peptide also contains
+  S, T or Y, the search engine may put the phosphate on H although it sits on a
+  neighbour – or the other way round.
+* Allowing H as an extra acceptor makes the search space bigger, which by itself
+  creates some extra (false) hits.
+
+We therefore treat pHis **very conservatively**. You will build evidence tiers yourself.
+:::
+
+
+```{r setup}
+
+library(ggrepel)
+library(dplyr)
+library(stringr)
+library(ggplot2)
+library(readxl)
+library(here)
+source("../R/setup.R")
+# keep contaminants here: we want the complete peptide lists of both searches
+styh <- read_sites("STYH", drop_contaminants = FALSE)
+sty  <- read_sites("STY",  drop_contaminants = FALSE)
+total_prot <- readxl::read_xlsx(
+  here::here("data/raw/total", "DE_total.xlsx"),
+  sheet = "normalized_abundances",
+  col_types = "text"
+) %>%
+  dplyr::select(protein_Id, protein_length) %>%
+  dplyr::distinct() %>%
+  dplyr::mutate(
+    protein_length = as.numeric(protein_length)
+  )
+head(total_prot)
+summary(total_prot$protein_length)
+```
+
+## 1. How many sites per residue in the two searches?
+
+```{r residues}
+bind_rows(styh, sty) |>
+  distinct(search, site_id, residue) |>
+  count(search, residue) |>
+  pivot_wider(names_from = search, values_from = n, values_fill = 0)
+
+bind_rows(styh, sty) |>
+  distinct(search, site_id, residue) |>
+  count(search, residue) |>
+  tidyr::complete(
+    search = c("STY", "STYH"),
+    residue,
+    fill = list(n = 0)) |>
+  ggplot(aes(x = residue, y = n, fill = search)) +
+  geom_col(
+    position = position_dodge(width = 0.85),
+    width = 0.75) +
+  geom_text(
+    aes(label = ifelse(n > 0, n, "")),
+    position = position_dodge(width = 0.85),
+    vjust = -0.5,
+    size = 6,
+    fontface = "bold") +
+  scale_fill_manual(
+    values = c("STY" = "midnightblue", "STYH" = "darkred"),
+    labels = c("STY" = "STY search", "STYH" = "STYH search")) +
+  scale_y_continuous(
+    breaks = scales::breaks_pretty(n = 5),
+    expand = expansion(mult = c(0, 0.15))) +
+  labs(
+    #title = "Identified phosphorylation sites by amino acid residue",
+    x = "Amino acid residue",
+    y = "Number of sites",
+    fill = NULL) +
+  theme_minimal(base_size = 22) +
+  theme(
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.y = element_line(
+      colour = "grey85",
+      linewidth = 0.5),
+    plot.title = element_text(
+      size = 28,
+      face = "bold",
+      hjust = 0.5),
+    axis.title = element_text(
+      size = 24,
+      face = "bold"),
+    axis.text = element_text(
+      size = 21,
+      colour = "black"),
+    legend.text = element_text(size = 21),
+    legend.position = "top",
+    plot.margin = margin(15, 20, 25, 15))
+
+##Prozentual
+styh |>
+  distinct(site_id, residue) |>
+  count(residue) |>
+  mutate(percent = n / sum(n) * 100,
+         label = paste0(residue, "\n", round(percent, 1), "%")) |>
+  ggplot(aes(x = "", y = n, fill = residue)) +
+  geom_col(width = 1) +
+  coord_polar(theta = "y") +
+  geom_text(aes(label = label),
+            position = position_stack(vjust = 0.5)) +
+  labs(fill = "Residue") +
+  theme_void()
+
+sty |>
+  distinct(site_id, residue) |>
+  count(residue) |>
+  mutate(percent = n / sum(n) * 100,
+         label = paste0(residue, "\n", round(percent, 1), "%")) |>
+  ggplot(aes(x = "", y = n, fill = residue)) +
+  geom_col(width = 1) +
+  coord_polar(theta = "y") +
+  geom_text(aes(label = label),
+            position = position_stack(vjust = 0.5)) +
+  labs(fill = "Residue") +
+  theme_void()
+```
+
+**Question:** the STYH search finds more sites in total. Are the additional sites
+only His sites, or do S/T/Y counts also change? Why might they?
+
+## 2. Localisation probability
+
+`best_loc_prob` = best localisation probability of a site over all samples
+(1 = the search engine is sure the phosphate sits on exactly this residue).
+
+```{r lp-distribution, fig.height=4}
+site_level <- distinct(styh, site_id, residue, best_loc_prob)
+
+ggplot(site_level, aes(best_loc_prob, colour = residue)) +
+  stat_ecdf(linewidth = 0.8) +
+  geom_vline(xintercept = 0.75, linetype = "dashed") +
+  labs(x = "best localisation probability", y = "fraction of sites with LP <= x",
+       title = "STYH search: localisation probability per residue")
+
+site_level |>
+  mutate(lp_class = lp_class(best_loc_prob)) |>
+  count(residue, lp_class) |>
+  pivot_wider(names_from = lp_class, values_from = n, values_fill = 0)
+```
+
+**Question:** Are His sites localised as well as S/T/Y sites? How many His sites
+have LP ≥ 0.75?
+
+## 3. One evidence table for every His site
+
+We now collect, for every His site, the evidence we need. Read each step.
+
+### 3a. Sites, localisation and reproducibility
+
+**Reproducibility is judged from the intensity** (detected = intensity > 0), not from
+the per-sample localisation probabilities: FragPipe sometimes reports an LP for a
+sample in which the site was *not quantified*.
+
+```{r lp-filled}
+styh |>
+  filter(residue == "H") |>
+  summarise(sample_rows = n(),
+            quantified = sum(!is.na(intensity)),
+            LP_reported_but_not_quantified = sum(is.na(intensity) & loc_prob_fragpipe > 0,
+                                                 na.rm = TRUE))
+```
+
+```{r evidence-1}
+his <- styh |>
+  filter(residue == "H") |>
+  group_by(site_id, locus_tag, product, peptide, best_loc_prob) |>
+  summarise(
+    n_samples_quant = sum(!is.na(intensity)),                  # of 27
+    n_samples_lp075 = sum(loc_prob_fragpipe >= 0.75, na.rm = TRUE),  # FragPipe LPs, for reference only
+    max_reps_in_group = max(tapply(!is.na(intensity), group, sum)),  # best group, of 3
+    .groups = "drop") |>
+  mutate(lp_class = lp_class(best_loc_prob))
+nrow(his)
+```
+
+### 3b. Is there an alternative acceptor on the peptide?
+
+If the peptide contains **no S, T or Y at all**, the phosphate cannot be
+mis-placed onto a neighbouring S/T/Y. That is the strongest kind of evidence we can
+get from the search alone. A `Peptide` entry can contain several sequence variants
+separated by `;` – we take the variant with the fewest S/T/Y.
+
+```{r evidence-2}
+peptide_variants("ANhEQIIEAIK;MANhEQIIEAIK")   # example: two variants, upper-cased
+n_sty_acceptors("ANhEQIIEAIK;MANhEQIIEAIK")
+
+his <- his |>
+  mutate(n_sty_acceptors = n_sty_acceptors(peptide),
+         no_alt_acceptor = n_sty_acceptors == 0,
+         co_phospho_STY  = co_phospho_sty(peptide))
+count(his, no_alt_acceptor)
+```
+
+### 3c. Does the STY-only search explain the same peptide?
+
+If the very same peptide was also identified as a phosphopeptide in the STY search,
+the spectrum can be explained **without** pHis. FragPipe writes phospho residues in
+lower case, so we compare upper-cased sequences. We count a His peptide as
+"explained" only if **all** its variants appear in the STY search.
+
+```{r evidence-3}
+sty_peptides <- phosphopeptide_set(sty)
+his <- his |>
+  mutate(seen_in_STY_search   = all_variants_in(peptide, sty_peptides),
+         partly_in_STY_search = any_variant_in(peptide, sty_peptides))
+count(his, no_alt_acceptor, seen_in_STY_search)
+```
+
+## 4. Worked example: HPr His15
+
+HPr (phosphocarrier protein of the PTS sugar uptake system) carries a **textbook
+pHis at His15** – the phosphate is transferred from enzyme I to HPr-His15 and on to
+sugar transporters. If we find any real pHis, HPr should be a candidate.
+
+```{r hpr-find}
+hpr <- find_protein("B7H15_05615") |> select(locus_tag, product, protein_key, staa8_uniprot)
+hpr
+```
+
+The same HPr peptide in the two searches:
+
+```{r hpr-compare}
+hpr_peptide <- "MEQNSYVIIDETGIHAR"
+bind_rows(styh, sty) |>
+  filter(protein_key %in% hpr$protein_key,
+         str_detect(toupper(peptide), hpr_peptide)) |>
+  group_by(search, site_id, residue, position, peptide, best_loc_prob) |>
+  summarise(n_samples_quant = sum(!is.na(intensity)), .groups = "drop") |>
+  arrange(search, position)
+```
+
+**Questions**
+
+* In the STY search, where is the phosphate placed on this peptide? In STYH?
+* Which interpretation is chemically / biologically more plausible, and why?
+* Is the STY-search interpretation "wrong" – or simply the best it could do without H?
+* Does this single example prove that pHis survives our workflow?
+
+## 5. His sites on proteins that *should* carry pHis
+
+Classical pHis proteins in bacteria: **histidine kinases** of two-component systems
+(autophosphorylation on His, transfer to Asp of the response regulator – note:
+pAsp was not searched), **HPr** and **enzyme I** of the PTS, and some metabolic
+enzymes (e.g. succinyl-CoA synthetase, nucleoside-diphosphate kinase).
+
+```{r canonical}
+canonical_pattern <- "histidine kinase|phosphocarrier|PTS|phosphoenolpyruvate|response regulator|succinate--CoA|nucleoside-diphosphate kinase"
+find_protein(canonical_pattern) |> count(product, sort = TRUE)
+
+his |>
+  filter(str_detect(product, regex(canonical_pattern, ignore_case = TRUE))) |>
+  select(locus_tag, product, site_id, peptide, best_loc_prob, n_sty_acceptors,
+         seen_in_STY_search, max_reps_in_group)
+
+
+## Define canonical phosphotransfer proteins
+canonical_proteins <- find_protein(canonical_pattern) |>
+  select(locus_tag) |>
+  distinct()
+
+## All proteins detected in the STYH search
+all_proteins <- styh |>
+  distinct(locus_tag)
+
+## Identify canonical proteins
+protein_tbl <- all_proteins |>
+  mutate(
+    canonical = locus_tag %in% canonical_proteins$locus_tag
+  )
+
+## Identify proteins with at least one pHis site
+his_proteins <- his |>
+  distinct(locus_tag) |>
+  mutate(has_pHis = TRUE)
+
+## Combine both datasets
+protein_tbl <- protein_tbl |>
+  left_join(his_proteins, by = "locus_tag") |>
+  mutate(
+    has_pHis = ifelse(is.na(has_pHis), FALSE, has_pHis)
+  )
+
+## Construct contingency table
+tab <- table(
+  factor(protein_tbl$canonical, levels = c(TRUE, FALSE)),
+  factor(protein_tbl$has_pHis, levels = c(TRUE, FALSE)))
+rownames(tab) <- c("Canonical", "Other proteins")
+colnames(tab) <- c("pHis detected", "No pHis detected")
+tab
+## Fisher's exact test
+fisher.test(tab, alternative = "greater")
+```
+
+**Question:** Do any histidine kinases show a His site? Is the site at the
+conserved, autophosphorylated His (look at the protein in UniProt via
+`staa8_uniprot`)? What about the many His sites on proteins that are *not* known
+pHis proteins?
+
+## 6. Your task: build confidence tiers
+
+Combine the evidence into **tiers**, from "strongest candidate" to "unreliable".
+Suggested criteria (you decide the order and thresholds – and justify them!):
+
+| evidence | column |
+|---|---|
+| no alternative S/T/Y acceptor on the peptide | `no_alt_acceptor` |
+| well localised | `best_loc_prob >= 0.75` |
+| reproducible: ≥ 2 of 3 replicates in some group | `max_reps_in_group >= 2` |
+| peptide **not** explained by the STY search | `!seen_in_STY_search` |
+
+Write your tiers below (set `eval: true` once you filled in the conditions).
+Number tiers 1 (strongest) to 6 (weakest) and **start every label with the number**.
+
+```{r my-tiers}
+#| eval: true
+
+
+my_tiers <- his |>
+  mutate(
+    tier = case_when(
+      no_alt_acceptor &
+        best_loc_prob >= 0.75 &
+        max_reps_in_group >= 2 &
+        !seen_in_STY_search ~ "1 strongest",
+      best_loc_prob >= 0.75 &
+        max_reps_in_group >= 2 &
+        !seen_in_STY_search ~ "2 very strong",
+      no_alt_acceptor &
+        best_loc_prob >= 0.75 ~ "3 strong",
+      best_loc_prob >= 0.75 ~ "4 moderate",
+      no_alt_acceptor ~ "5 weak",
+      TRUE ~ "6 unreliable"))
+count(my_tiers, tier)
+
+#add plot
+
+my_tiers |>
+  count(tier) |>
+  mutate(tier = factor(
+    tier,
+    levels = c(
+      "1 strongest",
+      "2 very strong",
+      "3 strong",
+      "4 moderate",
+      "5 weak",
+      "6 unreliable"
+    )
+  )) |>
+  ggplot(aes(tier, n)) +
+  geom_col() +
+   geom_col(fill = "midnightblue") +
+  labs(
+    x = "Tier",
+    y = "Number of sites",
+    title = "His-site confidence tiers"
+  ) + 
+  theme_minimal()
+
+```
+
+Check your tiers against the lecturer's reference (counts only – it tells you
+*how many* sites agree, not *which*):
+
+```{r check}
+#| eval: true
+check_his_tiers(my_tiers)
+```
+
+Which are the strongest sites? 
+The following sites fullfil all criteria of the strongest confidence tier: no alternative S/T/Y acceptor, localisation
+probability ≥ 0.75, reproducible detection (≥ 2 replicates in one group), and not explained by the STY search (are located
+in tier 1).
+
+```{r}
+my_tiers |>
+  filter(tier == "1 strongest") |>
+  select(
+    site_id,
+    locus_tag,
+    product,
+    peptide,
+    best_loc_prob,
+    max_reps_in_group)
+
+```
+
+according to  String, they are not linked in any way. They don't belong to an obvious pathway.
+
+
+
+```{r}
+my_tiers %>%
+  filter(tier == "2 very strong") %>%
+  distinct(site_id,locus_tag, product) %>%
+  arrange(product)
+```
+
+
+
+## 6.1 is it random (histidine kinase annotated proteins)?
+Possible histidine kinase annotated proteins (genome wide)
+
+```{r}
+find_protein("histidine kinase") |>
+  select(locus_tag, product)
+
+```
+
+found in the dataset styh sites
+```{r}
+tcs <- find_protein("histidine kinase") |>
+  select(locus_tag, product)
+
+styh |>
+  distinct(locus_tag) |>
+  inner_join(tcs, by = "locus_tag")
+```
+
+
+Following a test is the phosphorilisation is random or not on histidine kinase annotated proteins(Fisher Test).
+```{r}
+##  define TCS-proteines 
+tcs <- find_protein("histidine kinase") |>
+  select(locus_tag) |>
+  distinct()
+
+## All proteins
+all_proteins <- styh |>
+  select(locus_tag) |>
+  distinct() |>
+  mutate(
+    TCS = locus_tag %in% tcs$locus_tag
+  )
+
+## Proteines with at least one pHis
+his_proteins <- his |>
+  select(locus_tag) |>
+  distinct() |>
+  mutate(has_pHis = TRUE)
+
+## put together
+protein_tbl <- all_proteins |>
+  left_join(his_proteins, by = "locus_tag") |>
+  mutate(
+    has_pHis = ifelse(is.na(has_pHis), FALSE, has_pHis)
+  )
+
+## 2x2-table
+tab <- table(
+  protein_tbl$TCS,
+  protein_tbl$has_pHis
+)
+
+tab
+
+## Fisher Exact Test
+fisher.test(tab)
+
+```
+Six proteins annotated as histidine kinases (TCS proteins) were identified in the dataset. None contained a detected
+histidine phosphosite. Consequently, the estimated odds ratio was 0. However, Fisher's exact test did not indicate a
+significant association between TCS membership and the occurrence of histidine phosphosites (p = 0.193). Not really valuable
+because only very few histidine kinase annotated proteins detected.
+
+#6.2 more on the topic histidine kinases
+
+Staphylococcus aureus is known to have 16 two-component systems  (doi: 10.3390/genes13010034)
+
+
+
+```{r}
+
+# ============================================================
+# Histidine phosphorylation on histidine kinases
+# Include sites regardless of localization probability
+# ============================================================
+
+# 1. Identify histidine kinase proteins by their annotation
+hk_proteins <- styh %>%
+  dplyr::filter(
+    stringr::str_detect(
+      stringr::str_to_lower(product),
+      "histidine kinase|sensor kinase|two-component.*kinase"
+    )
+  ) %>%
+  dplyr::distinct(locus_tag, product)
+
+# Inspect which histidine kinases were identified
+hk_proteins
+
+# 2. Extract histidine phosphorylation sites from these proteins
+hk_his_sites <- styh %>%
+  dplyr::filter(
+    locus_tag %in% hk_proteins$locus_tag
+  ) %>%
+  dplyr::mutate(
+    residue = stringr::str_extract(
+      site_id, "_[STYH](?=\\d+$)"
+    ),
+    residue = stringr::str_remove(residue, "^_"),
+    position = as.numeric(
+      stringr::str_extract(site_id, "\\d+$")
+    )
+  ) %>%
+  dplyr::filter(residue == "H")
+
+# 3. Inspect all detected histidine sites on histidine kinases
+# No localization probability filter is applied
+hk_his_sites
+
+# 4. Summarise evidence for each site
+hk_his_summary <- hk_his_sites %>%
+  dplyr::group_by(
+    site_id,
+    locus_tag,
+    product,
+    peptide,
+    position
+  ) %>%
+  dplyr::summarise(
+    n_samples_quant = sum(!is.na(intensity)),
+    n_samples_lp075 = sum(
+      loc_prob_fragpipe >= 0.75,
+      na.rm = TRUE
+    ),
+    n_samples_low_lp = sum(
+      !is.na(loc_prob_fragpipe) &
+        loc_prob_fragpipe < 0.75
+    ),
+    best_loc_prob = if (
+      all(is.na(best_loc_prob))
+    ) NA_real_ else max(best_loc_prob, na.rm = TRUE),
+    max_reps_in_group = max(
+      tapply(!is.na(intensity), group, sum)
+    ),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(
+    dplyr::desc(n_samples_quant)
+  )
+
+# 5. Display the summary
+hk_his_summary
+
+# 6. Count how many histidine kinase proteins and
+#    histidine phosphorylation sites were found
+nrow(hk_proteins)
+dplyr::n_distinct(hk_his_summary$locus_tag)
+nrow(hk_his_summary)
+
+```
+
+
+We can find 6 kinase annotations (same as in the segment 6.1) in our styh data (the rest might not have been detected). None of them were found to have any histidine-phosphorylated site(s).
+
+
+Check for any phosphorilated sites on the detected histidine kinases:
+```{r}
+
+# Check all phosphorylation sites on the six histidine kinases,
+# regardless of which amino acid is modified
+
+hk_all_sites <- styh %>%
+  dplyr::filter(
+    locus_tag %in% hk_proteins$locus_tag
+  ) %>%
+  dplyr::mutate(
+    residue = stringr::str_extract(
+      site_id, "_[STYH](?=\\d+$)"
+    ),
+    residue = stringr::str_remove(residue, "^_"),
+    position = as.numeric(
+      stringr::str_extract(site_id, "\\d+$")
+    )
+  )
+
+# Count sites by residue type
+hk_all_sites %>%
+  dplyr::group_by(residue) %>%
+  dplyr::summarise(
+    n_sites = dplyr::n_distinct(site_id),
+    n_measurements = sum(!is.na(intensity)),
+    .groups = "drop"
+  )
+
+# List all sites, their localization probabilities and peptides
+hk_all_sites %>%
+  dplyr::distinct(
+    locus_tag,
+    product,
+    site_id,
+    residue,
+    position,
+    peptide,
+    best_loc_prob
+  ) %>%
+  dplyr::arrange(locus_tag, position)
+
+```
+
+We found multiple phosphorilations on STY sites (in total 18 distinct sites)
+
+Quick check, on which kinase are these sites located?
+
+```{r}
+
+# Summarise all phosphorylation sites on histidine kinases
+hk_site_details <- hk_all_sites %>%
+  dplyr::group_by(
+    locus_tag,
+    product,
+    residue,
+    site_id,
+    position,
+    peptide
+  ) %>%
+  dplyr::summarise(
+    best_loc_prob = if (
+      all(is.na(best_loc_prob))
+    ) NA_real_ else max(best_loc_prob, na.rm = TRUE),
+    n_samples_quant = sum(!is.na(intensity)),
+    n_samples_lp075 = sum(
+      loc_prob_fragpipe >= 0.75,
+      na.rm = TRUE
+    ),
+    .groups = "drop"
+  ) %>%
+  dplyr::arrange(locus_tag, residue, position)
+
+hk_site_details
+
+```
+
+The most identified one is B7H15_11550 which has multiple phospho-sites close to 
+each other so it might represent a multiple phosphorylated peptide region. Based on String it is involved in Potassium transport, ion transport and Two-component
+regulatory system.
+
+Interestingly no autophosphorilated histidine sites were detected on the kinases that were found.
+
+Our 5 Tier1 proteins are outside of the usual canonical histidine-kinase category
+
+
+```{r}
+# 1. Define protein annotation patterns
+
+canonical_pattern <- paste(
+  "histidine kinase",
+  "sensor kinase",
+  "phosphocarrier",
+  "PTS",
+  "phosphoenolpyruvate",
+  "response regulator",
+  "two-component",
+  "phosphorelay",
+  "receiver domain",
+  "succinate--CoA",
+  "succinyl-CoA synthetase",
+  "nucleoside-diphosphate kinase",
+  "HPr",
+  "enzyme I",
+  sep = "|"
+)
+
+# More specific pattern for TCS-associated proteins
+tcs_pattern <- paste(
+  "histidine kinase",
+  "sensor kinase",
+  "response regulator",
+  "two-component",
+  "phosphorelay",
+  "receiver domain",
+  sep = "|"
+)
+
+# 2. Identify canonical pHis proteins
+
+canonical_proteins <- find_protein(canonical_pattern) |>
+  dplyr::distinct(locus_tag, product)
+
+canonical_proteins
+
+# 3. Identify TCS-associated proteins
+
+tcs_proteins <- find_protein(tcs_pattern) |>
+  dplyr::distinct(locus_tag, product)
+
+tcs_proteins
+
+# 4. Identify which proteins were detected in STYH
+
+all_proteins <- styh |>
+  dplyr::distinct(locus_tag)
+
+canonical_detected <- canonical_proteins |>
+  dplyr::inner_join(all_proteins, by = "locus_tag")
+
+tcs_detected <- tcs_proteins |>
+  dplyr::inner_join(all_proteins, by = "locus_tag")
+
+# 5. Count annotated and detected proteins
+
+data.frame(
+  category = c("Canonical pHis proteins", "TCS-associated proteins"),
+  annotated = c(
+    nrow(canonical_proteins),
+    nrow(tcs_proteins)),
+  detected_in_STYH = c(
+    nrow(canonical_detected),
+    nrow(tcs_detected)))
+
+# 6. Check all histidine sites on canonical proteins
+
+canonical_his_sites <- styh |>
+  dplyr::filter(
+    locus_tag %in% canonical_detected$locus_tag
+  ) |>
+  dplyr::mutate(
+    residue = stringr::str_extract(
+      site_id, "_[STYH](?=\\d+$)"
+    ),
+    residue = stringr::str_remove(residue, "^_"),
+    position = as.numeric(
+      stringr::str_extract(site_id, "\\d+$")
+    )
+  ) |>
+  dplyr::filter(residue == "H") |>
+  dplyr::group_by(
+    locus_tag, product, site_id, position, peptide
+  ) |>
+  dplyr::summarise(
+    best_loc_prob = if (all(is.na(best_loc_prob))) {
+      NA_real_
+    } else {
+      max(best_loc_prob, na.rm = TRUE)
+    },
+    n_samples_detected = sum(intensity > 0, na.rm = TRUE),
+    n_samples_lp075 = sum(
+      loc_prob_fragpipe >= 0.75, na.rm = TRUE
+    ),
+    .groups = "drop"
+  ) |>
+  dplyr::arrange(best_loc_prob)
+
+canonical_his_sites
+
+# 7. Check all histidine sites on TCS proteins
+
+tcs_his_sites <- styh |>
+  dplyr::filter(
+    locus_tag %in% tcs_detected$locus_tag
+  ) |>
+  dplyr::mutate(
+    residue = stringr::str_extract(
+      site_id, "_[STYH](?=\\d+$)"
+    ),
+    residue = stringr::str_remove(residue, "^_"),
+    position = as.numeric(
+      stringr::str_extract(site_id, "\\d+$")
+    )
+  ) |>
+  dplyr::filter(residue == "H") |>
+  dplyr::group_by(
+    locus_tag, product, site_id, position, peptide
+  ) |>
+  dplyr::summarise(
+    best_loc_prob = if (all(is.na(best_loc_prob))) {
+      NA_real_
+    } else {
+      max(best_loc_prob, na.rm = TRUE)
+    },
+    n_samples_detected = sum(intensity > 0, na.rm = TRUE),
+    n_samples_lp075 = sum(
+      loc_prob_fragpipe >= 0.75, na.rm = TRUE
+    ),
+    .groups = "drop"
+  ) |>
+  dplyr::arrange(best_loc_prob)
+
+tcs_his_sites
+
+
+
+# 8. Identify detected histidine kinases
+histidine_kinases <- tcs_detected %>%
+  dplyr::filter(
+    stringr::str_detect(
+      product,
+      stringr::regex("histidine kinase|sensor kinase", ignore_case = TRUE)
+    )
+  ) %>%
+  dplyr::distinct(locus_tag, product)
+
+# 9. Check for histidine phosphorylation sites on these kinases
+hk_his_sites <- styh %>%
+  dplyr::filter(locus_tag %in% histidine_kinases$locus_tag) %>%
+  dplyr::mutate(
+    residue = stringr::str_extract(
+      site_id, "_[STYH](?=\\d+$)"
+    ),
+    residue = stringr::str_remove(residue, "^_")
+  ) %>%
+  dplyr::filter(residue == "H") %>%
+  dplyr::distinct(locus_tag, site_id)
+
+# 10. Prepare data for plotting
+hk_plot_data <- histidine_kinases %>%
+  dplyr::left_join(
+    hk_his_sites %>%
+      dplyr::count(locus_tag, name = "n_pHis_sites"),
+    by = "locus_tag"
+  ) %>%
+  dplyr::mutate(
+    n_pHis_sites = tidyr::replace_na(n_pHis_sites, 0),
+    protein_label = paste0(product, " (", locus_tag, ")")
+  ) %>%
+  dplyr::arrange(product) %>%
+  dplyr::mutate(
+    protein_label = factor(
+      protein_label,
+      levels = rev(protein_label)
+    )
+  )
+
+# 11. Plot detected histidine kinases and their pHis sites
+ggplot2::ggplot(
+  hk_plot_data,
+  ggplot2::aes(y = protein_label)
+) +
+  ggplot2::geom_vline(
+    xintercept = 0,
+    colour = "grey80",
+    linewidth = 0.8
+  ) +
+  ggplot2::geom_point(
+    ggplot2::aes(x = n_pHis_sites),
+    colour = "darkred",
+    size = 5
+  ) +
+  ggplot2::geom_text(
+    ggplot2::aes(
+      x = 0,
+      label = n_pHis_sites
+    ),
+    colour = "darkred",
+    size = 6,
+    fontface = "bold",
+    hjust = -0.8
+  ) +
+  ggplot2::scale_x_continuous(
+    breaks = 0:5,
+    limits = c(-0.1, 1),
+    expand = ggplot2::expansion(mult = c(0, 0.05))
+  ) +
+  ggplot2::labs(
+    title = "Histidine kinases detected in the STYH dataset",
+    subtitle = "No histidine-phosphorylated sites were detected",
+    x = "Number of detected pHis sites",
+    y = NULL
+  ) +
+  ggplot2::theme_minimal(base_size = 22) +
+  ggplot2::theme(
+    panel.grid.major.x = ggplot2::element_blank(),
+    panel.grid.minor = ggplot2::element_blank(),
+    panel.grid.major.y = ggplot2::element_line(
+      colour = "grey90",
+      linewidth = 0.5
+    ),
+    plot.title = ggplot2::element_text(
+      size = 28,
+      face = "bold",
+      hjust = 0.5
+    ),
+    plot.subtitle = ggplot2::element_text(
+      size = 20,
+      hjust = 0.5
+    ),
+    axis.title.x = ggplot2::element_text(
+      size = 22,
+      face = "bold"
+    ),
+    axis.text.x = ggplot2::element_text(
+      size = 20,
+      colour = "black"
+    ),
+    axis.text.y = ggplot2::element_text(
+      size = 17,
+      colour = "black"
+    ),
+    plot.margin = ggplot2::margin(15, 30, 15, 15)
+  )
+
+
+```
+
+
+If localisation probability does not matter:
+
+```{r}
+# All STYH sites on TCS-associated proteins,
+# including sites with low localization probability
+
+tcs_all_sites <- styh |>
+  dplyr::filter(
+    locus_tag %in% tcs_detected$locus_tag
+  ) |>
+  dplyr::mutate(
+    residue = stringr::str_extract(
+      site_id, "_[STYH](?=\\d+$)"
+    ),
+    residue = stringr::str_remove(residue, "^_"),
+    position = as.numeric(
+      stringr::str_extract(site_id, "\\d+$")
+    )
+  ) |>
+  dplyr::group_by(
+    locus_tag, product, residue, site_id,
+    position, peptide
+  ) |>
+  dplyr::summarise(
+    best_loc_prob = if (all(is.na(best_loc_prob))) {
+      NA_real_
+    } else {
+      max(best_loc_prob, na.rm = TRUE)
+    },
+    n_samples_detected = sum(intensity > 0, na.rm = TRUE),
+    n_samples_lp075 = sum(
+      loc_prob_fragpipe >= 0.75, na.rm = TRUE
+    ),
+    .groups = "drop"
+  ) |>
+  dplyr::arrange(locus_tag, residue, position)
+
+# Sites with localization probability below 0.75
+tcs_low_probability <- tcs_all_sites |>
+  dplyr::filter(
+    is.na(best_loc_prob) | best_loc_prob < 0.75
+  )
+
+tcs_low_probability
+```
+
+how often in a specific group?
+```{r}
+# Summarise positive-intensity observations
+# for the two response-regulator histidine sites
+
+response_regulator_sites <- styh |>
+  dplyr::filter(
+    locus_tag %in% c("B7H15_03935", "B7H15_11300"),
+    stringr::str_detect(site_id, "_H\\d+$")
+  ) |>
+  dplyr::group_by(
+    locus_tag,
+    product,
+    site_id,
+    peptide,
+    best_loc_prob,
+    group
+  ) |>
+  dplyr::summarise(
+    n_detected = sum(intensity > 0, na.rm = TRUE),
+    total_intensity = sum(intensity, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  dplyr::arrange(locus_tag, group)
+
+response_regulator_sites
+```
+
+Two histidine phosphorylation candidates were found in proteins annotated as DNA-binding response regulators. The site H128 in B7H15_11300 (H128 site) had a localization probability of 0.7882, whereas H124 in B7H15_03935 had a probability of 0.3258. Both sites were detected with positive intensity in just one sample from the anc_SN group and were not detected in the other sample groups. -> Neither candidate showed sufficient reproducibility to be considered a high-confidence phosphorylation site.
+
+B7H15_11300 (String) is involved in quorum sensing, signaling and cell comunication. FDR below 0.05 (statistically enriched in Stringnetwork)
+Check how it stands against our categories for strong likelihood, that really the His is phophorylated.
+
+```{r}
+
+# Check B7H15_11300 H128 against the four Tier 1 criteria
+
+candidate_site <- "lcl_CP020619.1_prot_ARG46599.1_2192_H128"
+
+# 1. Get the histidine site and its peptide sequence
+candidate_data <- styh |>
+  dplyr::filter(site_id == candidate_site)
+
+candidate_peptide <- candidate_data |>
+  dplyr::distinct(peptide) |>
+  dplyr::pull(peptide)
+
+# 2. Check whether the peptide contains another S, T or Y
+# The lowercase h marks the candidate phosphorylated histidine.
+no_alt_acceptor <- !stringr::str_detect(
+  stringr::str_to_upper(candidate_peptide),
+  "[STY]"
+)
+
+# 3. Check the best localization probability
+best_loc_prob <- max(
+  candidate_data$best_loc_prob,
+  na.rm = TRUE
+)
+
+# 4. Check reproducibility: count positive detections per group
+group_detections <- candidate_data |>
+  dplyr::group_by(group) |>
+  dplyr::summarise(
+    n_detected = sum(intensity > 0, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+max_reps_in_group <- max(group_detections$n_detected)
+
+# 5. Check whether the same peptide was found in the STY search
+sty_peptides <- sty |>
+  dplyr::filter(!is.na(peptide)) |>
+  dplyr::mutate(
+    peptide_key = stringr::str_to_upper(peptide)
+  ) |>
+  dplyr::distinct(peptide_key)
+
+candidate_peptide_key <- stringr::str_to_upper(candidate_peptide)
+
+seen_in_STY_search <- candidate_peptide_key %in%
+  sty_peptides$peptide_key
+
+# 6. Combine all four criteria
+candidate_check <- tibble::tibble(
+  locus_tag = "B7H15_11300",
+  site_id = candidate_site,
+  peptide = candidate_peptide,
+  no_alt_acceptor = no_alt_acceptor,
+  best_loc_prob = best_loc_prob,
+  max_reps_in_group = max_reps_in_group,
+  seen_in_STY_search = seen_in_STY_search
+) |>
+  dplyr::mutate(
+    criterion_1 = no_alt_acceptor,
+    criterion_2 = best_loc_prob >= 0.75,
+    criterion_3 = max_reps_in_group >= 2,
+    criterion_4 = !seen_in_STY_search,
+    passes_all = criterion_1 &
+      criterion_2 &
+      criterion_3 &
+      criterion_4
+  )
+
+candidate_check
+group_detections
+
+```
+It passes two of the categories (its not seen in the STY search and it has a LP >0.75). However it has a Threonine close by and also is only found once in anc_SN. 
+
+
+#6.3 Where are the phosphosites on the Tier1?
+First only the positions of the pHis on the proteins.
+```{r}
+
+
+# Keep only the strongest-tier histidine sites
+strongest_his <- my_tiers %>%
+  dplyr::filter(tier == "1 strongest") %>%
+  dplyr::select(site_id) %>%
+  dplyr::distinct()
+
+# Extract strongest-tier histidine sites and protein IDs
+his_sites <- styh %>%
+  dplyr::inner_join(strongest_his, by = "site_id") %>%
+  dplyr::mutate(
+    residue = stringr::str_extract(
+      site_id, "_[STYH](?=\\d+$)"),
+    position = as.numeric(
+      stringr::str_extract(site_id, "\\d+$")),
+    protein_Id = stringr::str_remove(
+      site_id, "_\\d+_[STYH]\\d+$"),
+    residue = stringr::str_remove(residue, "^_")) %>%
+  dplyr::filter(residue == "H") %>%
+  dplyr::distinct(protein_Id, position, peptide)
+
+# Standardize protein IDs and retrieve protein lengths
+protein_lengths <- total_prot %>%
+  dplyr::mutate(
+    protein_Id = stringr::str_extract(
+      protein_Id,
+      "lcl_CP020619\\.1_prot_ARG\\d+\\.1")) %>%
+  dplyr::select(protein_Id, protein_length) %>%
+  dplyr::distinct()
+
+# Define the desired protein order
+protein_order <- c(
+  "lcl_CP020619.1_prot_ARG45065.1",
+  "lcl_CP020619.1_prot_ARG45665.1",
+  "lcl_CP020619.1_prot_ARG45823.1",
+  "lcl_CP020619.1_prot_ARG46060.1",
+  "lcl_CP020619.1_prot_ARG46318.1")
+
+# Combine phosphorylation sites with protein lengths
+plot_data <- his_sites %>%
+  dplyr::inner_join(protein_lengths, by = "protein_Id") %>%
+  dplyr::filter(!is.na(protein_length)) %>%
+  dplyr::mutate(
+    protein_Id = factor(protein_Id, levels = rev(protein_order)))
+
+# readable protein labels
+protein_names <- c(
+  "lcl_CP020619.1_prot_ARG45065.1" =
+    "Protein (Peptide 1)",
+  "lcl_CP020619.1_prot_ARG45665.1" =
+    "Protein (Peptide 2)",
+  "lcl_CP020619.1_prot_ARG45823.1" =
+    "Protein (Peptide 3)",
+  "lcl_CP020619.1_prot_ARG46060.1" =
+    "Protein (Peptide 4)",
+  "lcl_CP020619.1_prot_ARG46318.1" =
+    "Protein (Peptide 5)")
+ 
+protein_labels <- plot_data %>%
+  dplyr::distinct(protein_Id) %>%
+  dplyr::mutate(
+    axis_label = unname(
+      protein_names[as.character(protein_Id)]
+    )
+  )
+
+# Plot protein lengths and Tier 1 phosphorylation positions
+ggplot2::ggplot(
+  plot_data,
+  ggplot2::aes(y = protein_Id)) +
+  # Protein length
+  ggplot2::geom_segment(
+    ggplot2::aes(
+      x = 1,
+      xend = protein_length,
+      yend = protein_Id),
+    linewidth = 4,
+    colour = "black") +
+
+  # Protein length labels
+  ggplot2::geom_text(
+    ggplot2::aes(
+      x = protein_length,
+      label = protein_length),
+    hjust = -0.4,
+    colour = "black",
+    size = 5,
+    fontface = "bold") +
+
+  # Histidine phosphorylation markers
+  ggplot2::geom_segment(
+    ggplot2::aes(
+      x = position,
+      xend = position,
+      y = as.numeric(protein_Id) - 0.12,
+      yend = as.numeric(protein_Id) + 0.12),
+    colour = "darkred",
+    linewidth = 1.5) +
+
+  # Histidine site labels
+  ggplot2::geom_text(
+    ggplot2::aes(
+      x = position,
+      y = as.numeric(protein_Id) + 0.22,
+      label = paste0("H", position)),
+    colour = "darkred",
+    size = 5,
+    fontface = "bold",
+    vjust = 0) +
+
+  # Protein labels
+  ggplot2::scale_y_discrete(
+    labels = stats::setNames(
+      protein_labels$axis_label,
+      as.character(protein_labels$protein_Id))) +
+
+  # Axis scaling
+  ggplot2::scale_x_continuous(
+    expand = ggplot2::expansion(mult = c(0.02, 0.15))) +
+
+  # Titles
+  ggplot2::labs(
+    #title = "Strongest-tier histidine phosphorylation sites",
+    x = "Amino acid position",
+    y = ""
+    ) +
+  ggplot2::theme_minimal(base_size = 22) +
+  ggplot2::theme(
+    panel.grid.major.x = ggplot2::element_blank(),
+    panel.grid.minor = ggplot2::element_blank(),
+    panel.grid.major.y = ggplot2::element_line(
+      colour = "grey90",
+      linewidth = 0.5),
+    plot.title = ggplot2::element_text(
+      size = 28,
+      face = "bold",
+      hjust = 0.5),
+    axis.title = ggplot2::element_text(
+      size = 24,
+      face = "bold"),
+    axis.text.x = ggplot2::element_text(
+      size = 20,
+      colour = "black"),
+    axis.text.y = ggplot2::element_text(
+      size = 17,
+      colour = "black",
+      lineheight = 1.2),
+    plot.margin = ggplot2::margin(15, 35, 15, 15))
+
+
+
+```
+
+
+for the H18 it seems to be retained across many examples according to Blast. So maybe conserved in ScpA proteins. ScpA H18 is highly conserved among the homologues based on the Blast dataset when put into clustal omega. Has partially solvent accessible sidechain (alphaFold) surrounded by hydrophobic residues.
+
+
+
+Now all phosphosites on these 5 proteins.
+
+```{r}
+
+# Identify the 5 proteins from the strongest-tier histidine sites
+strongest_his <- my_tiers %>%
+  dplyr::filter(tier == "1 strongest") %>%
+  dplyr::select(site_id) %>%
+  dplyr::distinct()
+
+# Extract the 5 protein IDs
+selected_proteins <- strongest_his %>%
+  dplyr::mutate(
+    protein_Id = stringr::str_remove(
+      site_id, "_\\d+_[STYH]\\d+$"
+    )
+  ) %>%
+  dplyr::distinct(protein_Id)
+
+# Extract ALL STYH phosphorylation sites on these 5 proteins
+all_sites <- styh %>%
+  dplyr::mutate(
+    residue = stringr::str_extract(
+      site_id, "_[STYH](?=\\d+$)"
+    ),
+    position = as.numeric(
+      stringr::str_extract(site_id, "\\d+$")
+    ),
+    protein_Id = stringr::str_remove(
+      site_id, "_\\d+_[STYH]\\d+$"
+    ),
+    residue = stringr::str_remove(residue, "^_")
+  ) %>%
+  dplyr::filter(residue %in% c("S", "T", "Y", "H")) %>%
+  dplyr::semi_join(selected_proteins, by = "protein_Id") %>%
+  dplyr::distinct(protein_Id, position, residue)
+
+# Standardize protein IDs and retrieve protein lengths
+protein_lengths <- total_prot %>%
+  dplyr::mutate(
+    protein_Id = stringr::str_extract(
+      protein_Id,
+      "lcl_CP020619\\.1_prot_ARG\\d+\\.1"
+    )
+  ) %>%
+  dplyr::select(protein_Id, protein_length) %>%
+  dplyr::distinct()
+
+# Combine phosphorylation sites with protein lengths
+plot_data <- all_sites %>%
+  dplyr::inner_join(protein_lengths, by = "protein_Id") %>%
+  dplyr::filter(!is.na(protein_length))
+
+# Plot all phosphorylation sites on the 5 selected proteins
+ggplot2::ggplot(
+  plot_data,
+  ggplot2::aes(y = factor(protein_Id))
+) +
+  ggplot2::geom_segment(
+    ggplot2::aes(
+      x = 1,
+      xend = protein_length,
+      yend = factor(protein_Id)
+    ),
+    linewidth = 3,
+    colour = "black"
+  ) +
+  ggplot2::geom_text(
+    ggplot2::aes(
+      x = protein_length,
+      label = protein_length
+    ),
+    hjust = -0.3,
+    colour = "black",
+    size = 3
+  ) +
+  ggplot2::scale_x_continuous(
+    expand = ggplot2::expansion(mult = c(0.02, 0.12))
+  ) +
+  ggplot2::geom_segment(
+    ggplot2::aes(
+      x = position,
+      xend = position,
+      y = as.numeric(factor(protein_Id)) - 0.08,
+      yend = as.numeric(factor(protein_Id)) + 0.08
+    ),
+    colour = "darkred",
+    linewidth = 0.8
+  ) +
+  ggrepel::geom_text_repel(
+  ggplot2::aes(
+    x = position,
+    y = as.numeric(factor(protein_Id)),
+    label = paste0(residue, position)
+  ),
+  colour = "darkred",
+  size = 3,
+  direction = "y",
+  nudge_y = 0.3,
+  segment.colour = "grey50",
+  segment.size = 0.3,
+  min.segment.length = 0,
+  box.padding = 0.3,
+  point.padding = 0.2,
+  max.overlaps = Inf
+  ) +
+  ggplot2::labs(
+    title = "All phosphorylation sites on the 5 selected proteins",
+    x = "Amino acid position",
+    y = "Protein ID"
+  ) +
+  ggplot2::theme_classic()
+
+
+
+
+
+```
+
+
+
+## 7. Real or artefact? A decision framework
+
+For each candidate, go through this list and write your verdict in your lab notebook.
+
+1. **Chemistry:** acid-labile pHis + acidic workflow → is it plausible the site survived?
+2. **Localisation:** LP ≥ 0.75? Any S/T/Y on the peptide? Same peptide explained by STY?
+3. **Reproducibility:** seen in ≥ 2/3 replicates of a group? In more than one group?
+4. **Biology:** is the protein a known His-phosphorylated protein? Is the His conserved?
+5. **Spectra:** (beyond this course, but name it) inspect the MS2 spectra – are there
+   fragment ions that pin the phosphate to H? pHis shows characteristic neutral
+   losses (e.g. −80, −98, −116 Da).
+6. **Orthogonal validation:** pHis-specific antibodies, non-acidic enrichment, mutation
+   of the His.
+
+**Discussion:** after this analysis, how would you phrase our evidence for (or against)
+the claim of Prust *et al.*? Distinguish "we found no evidence" from "we found evidence
+of absence".
+
+
+
+```{r session}
+sessionInfo()
+```
