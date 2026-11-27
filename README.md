@@ -1,4 +1,10 @@
-# Bio253 – *S. aureus* JE2 proteome & phosphoproteome: starter pack
+# Bio253 – *S. aureus* JE2 proteome & phosphoproteome: DIN Vuckics Repo Fork
+
+**Group mval: Din Vuckic & Mete Kabranlar.**
+
+**Start here: [our revised Topic C question, hypotheses and project plan](C_mutant_validation_DinMete/project_outlines/PROJECT_PLAN_mval.md).**
+
+For the practical sequence, required inputs and purpose of each analysis, follow the [step-by-step project workflow](C_mutant_validation_DinMete/project_outlines/PROJECT_WORKFLOW_mval.md).
 
 Starter code for the Bio253 block course (UZH/ETHZ, HS2026). You work in small groups
 (2–3 people) on a **fresh, unpublished** proteomics data set of *Staphylococcus aureus*
@@ -11,13 +17,31 @@ Lecturer: Jonas Grossmann and José Luis Ruiz Rodriguez (Functional Genomics Cen
 > [data/README.md](data/README.md)). Your code and rendered reports are — you hand in
 > your work by pushing your clone of this repo to GitHub (see *Handing in*).
 
+## Selected group project: Topic C
+
+Our focused subsection is **Revised topic C: Does the `stp` mutant behave like a kinase mutant during supernatant exposure?** We validate the mutant protein profiles, investigate possible polar effects, and compare genotype-dependent responses to supernatant: does the `stp` mutant also have reduced Stk1, and does its response resemble the `stk` mutant? See the [Project C plan, questions and hypotheses](C_mutant_validation_DinMete/project_outlines/PROJECT_PLAN_mval.md) and [rescue/suppression literature review](C_mutant_validation_DinMete/docs/stk_stp_rescue_evidence_mval.md). These documents state hypotheses and interpretation limits, not analysis results.
+
+**Revised main question:** Does disruption of `stp1` also reduce Stk1 protein abundance through a possible polar effect, and do the `stp` and `stk` mutants show similar protein-abundance responses to *Pseudomonas aeruginosa* supernatant?
+
+**Scope:** the primary comparisons are total-proteome protein abundance in TSB and SN. Phosphosites were out of scope in the first plan (5 Nov 2026); since 13 Nov 2026 they are reported as a **supporting layer** only (Steps 8–9 and section 7 of the report): coverage is too thin for a quantitative phosphorylation claim, and no phosphosite responds differently to PASN in a mutant. SNpulse samples are not part of the primary comparisons; they are inspected for mutant validation and QC and contribute to the variance estimate of the model (all 27 samples).
+
+**Hypotheses to test:**
+
+- **H1 - mutant validation:** `stp` has reduced Stp1 and accompanying reduction of Stk1, consistent with a possible polar effect.
+- **H2 - interaction response:** some TSB-to-SN responses differ between a mutant and the parental strain.
+- **H3 - shared mutant response:** some altered exposure responses are shared by `stp` and `stk`, consistent with a contribution from reduced kinase function.
+
+Interaction contrasts distinguish baseline mutant differences from differences in the response to exposure. Published rescue/suppression experiments guide interpretation, but our dataset cannot prove a polar mechanism or causal rescue. Full methods and limitations are in [PROJECT_PLAN_mval.md](C_mutant_validation_DinMete/project_outlines/PROJECT_PLAN_mval.md).
+
+For continuing the same conversation and project on another computer, see [working on two PCs](C_mutant_validation_DinMete/docs/WORKING_ON_TWO_PCS_mval.md). Chat access and Git file updates are separate.
+
 ## Biology in 10 lines or even more
 
 1. *S. aureus* and *Pseudomonas aeruginosa* often co-infect, e.g. in cystic fibrosis lungs. *P. aeruginosa* usually suppresses *S. aureus* with secreted molecules (HQNO, PQS, pyocyanin, siderophores, proteases …).
 2. In this experiment, *S. aureus* **never meets living *P. aeruginosa***. It is grown in medium containing **30 % cell-free, sterile-filtered spent medium of *P. aeruginosa* PAO1** ("PA supernatant", **PASN**). It sees only the secreted molecules, in a medium that is partly depleted of nutrients.
 3. Niggli *et al.* 2023 (*mBio*): *S. aureus* quickly evolves resistance to PASN. Schwyter *et al.* 2025 (*mSystems*): the resistance comes mostly from a large **plastic** proteome response. One evolved line also had a ***tcyA*** mutation, which destroyed the cystine transporter TcyABC.
 4. Bacteria sense their environment through phosphorylation. *S. aureus* has one main Ser/Thr kinase, **Stk1 (PknB)**, and its partner phosphatase **Stp1**. The genes sit next to each other: *stp1* first, then *stk1*.
-5. Huemer *et al.* 2021 (*Sci Signal*): PknB/Stp control quiescence and antibiotic tolerance. Prust *et al.* 2021 (*MCP*): a deep *S. aureus* phosphoproteome, which also reports **phospho-histidine**.
+5. Huemer *et al.* 2023 (*Sci Signal*): PknB/Stp control quiescence and antibiotic tolerance. Prust *et al.* 2021 (*MCP*): a deep *S. aureus* phosphoproteome, which also reports **phospho-histidine**.
 6. Here: the JE2 wild type (**anc**) and two transposon mutants, **stk** (*stk1::Tn*) and **stp** (*stp1::Tn*), each grown in three media.
 7. **TSB** = control. **SN** = ~15 h in 70 % TSB + 30 % PASN (long-term response). **SNpulse** = grown in TSB, then 15 min in PASN (immediate response).
 8. Every sample was measured twice: **total proteome** (protein amounts) and **phospho-enriched** (Fe-IMAC; phospho-sites).
@@ -84,7 +108,8 @@ sites <- read_sites("STYH")                 # FragPipe phospho-sites, long forma
 | `data/checksums.md5`, `data/check_data.sh/.R` | MD5 check of everything extracted from the course data zip |
 | `analyses/` | exercise notebooks (Quarto, R) |
 | `reference/` | **protein metadata for all 4,155 database entries** (UniProt accession + e-value, gene symbol, EC, GO/KEGG/STRING) + the ErmB proposal |
-| `notebook/` | **your** lab notebook: one dated entry per session |
+| `notebook/` | lecturer's lab-notebook instructions and template |
+| `C_mutant_validation_DinMete/` | **our group's files**: our analysis scripts in `scripts/` (`01_setup_check_mval.R` ... `12d_qr_references_mval.R`, run from the repository root), rules (`codingrules_mval.md`), project plan/workflow, docs, results, and our lab notebook (`C_mutant_validation_DinMete/notebook/`, one dated entry per session) |
 | `tests/` | `testthat` checks of the helpers and of the sign convention |
 | `data/` | local data only (git-ignored), see `data/README.md` |
 | `CLAUDE.md` / `AGENTS.md` | instructions for your AI coding agent |
@@ -125,8 +150,8 @@ git remote set-url origin https://github.com/<you>/bio253-<group>.git   # your o
 git push -u origin main
 ```
 
-What goes in: all code (`R/`, `scripts/`, `analyses/*.qmd`, your own `reports/`), the rendered
-HTML reports (`analyses/_output/`, `reports/*.html`), and `notebook/`.
+What goes in: all code (`R/`, `scripts/`, `C_mutant_validation_DinMete/scripts/`, `analyses/*.qmd`, your own `reports/`), the rendered
+HTML reports (`analyses/_output/`, `reports/*.html`), and `C_mutant_validation_DinMete/notebook/`.
 What stays out: everything in `data/` (raw Excel/TSV/parquet/FASTA — `.gitignore` takes care of it).
 Before the final push run `git status` and check that no data file is staged.
 
@@ -144,7 +169,7 @@ You're encouraged to use an agent (Claude Code, Copilot, Cursor …). Some rules
 4. **Ask for the sign.** Agents (and people) often get `A_vs_B` backwards.
 5. **Verify claims about biology.** Agents make up references and protein
    functions. Check them in UniProt, PubMed or the papers, and cite what you used.
-6. **Keep a lab notebook** in `notebook/`: what you asked, what you ran, what you
+6. **Keep a lab notebook** in `C_mutant_validation_DinMete/notebook/`: what you asked, what you ran, what you
    found, and what was wrong.
 7. **Small steps.** Ask for one plot or one table at a time, not "analyse everything".
 
@@ -153,7 +178,7 @@ You're encouraged to use an agent (Claude Code, Copilot, Cursor …). Some rules
 * Schwyter L. *et al.* (2025) *mSystems*, doi:10.1128/msystems.00262-25 – TcyABC, plastic vs genetic response to PASN.
 * Niggli S. *et al.* (2023) *mBio* – rapid, strain-specific resistance evolution of *S. aureus* against PASN.
 * Prust N. *et al.* (2021) *Mol Cell Proteomics* 20:100034 – *S. aureus* phosphoproteome, Stk1 targets, pHis.
-* Huemer M. *et al.* (2021) *Science Signaling*, doi:10.1126/scisignal.abj8194 – PknB/Stp, quiescence and antibiotic tolerance.
+* Huemer M. *et al.* (2023) *Science Signaling*, doi:10.1126/scisignal.abj8194 – PknB/Stp, quiescence and antibiotic tolerance.
 
 ## License
 

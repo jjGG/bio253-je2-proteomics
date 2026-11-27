@@ -1,0 +1,6 @@
+protein_key,locus_tag,product,contrast,diff,FDR,statistic,estimate_type,imputed
+lcl_CP020619.1_prot_ARG46658.1_2256,B7H15_11645,transglycosylase SceD,stk_vs_anc,3.1394804516042383,2.8816954810670627e-10,24.578715995974473,observed,FALSE
+lcl_CP020619.1_prot_ARG44807.1_298,B7H15_01500,glycyl-glycine endopeptidase LytM,stk_vs_anc,1.7683978713200936,1.6458259874149869e-4,15.656219787565696,observed,FALSE
+lcl_CP020619.1_prot_ARG47142.1_2776,B7H15_14290,transglycosylase IsaA,stk_vs_anc,1.664577507493788,1.6458259874149869e-4,16.934678910662832,observed,FALSE
+lcl_CP020619.1_prot_ARG45458.1_987,B7H15_05060,MAP domain-containing protein,stk_vs_anc,2.0058928240248743,2.9681261461743966e-4,12.81696784603288,observed,FALSE
+lcl_CP020619.1_prot_ARG46696.1_2295,B7H15_11840,aminobenzoyl-glutamate utilization protein B,stk_vs_anc,1.2003652740718032,0.00342042135819682,31.117106041524455,observed,FALSE

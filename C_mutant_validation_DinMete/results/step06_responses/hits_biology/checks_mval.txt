@@ -1,0 +1,10 @@
+CHECK proteins in Fig 2 (formal + exploratory): 7
+CHECK STRING: 33 partner rows, 70 edges (score >= 0.7) among hits + partners; STRING 12.5 species STRG0B09NBK queried 2026-11-18
+CHECK nodes: 37 STRING nodes; not in our metadata: 0; entry classes: cds 37
+CHECK layout: 6 modules; 6 of 70 edges link two modules
+CHECK kdp proteins in the annotation: kdpC B7H15_11530, kdpB B7H15_11535, kdpA B7H15_11540, B7H15_11545 B7H15_11545, kdpD B7H15_11550, kdpE B7H15_11555
+CHECK kdpD: peptide observations SN/TSB = 0.054 (rank 9 of 1121 well-covered proteins; median protein 1)
+CHECK kdpE: peptide observations SN/TSB = 0.076 (rank 12 of 1121 well-covered proteins; median protein 1)
+CHECK total peptides per sample, median TSB / SN: TSB 32439 / SN 30788
+CHECK peptide-matched SN - TSB, median per gene x genotype: kdpD anc +1.27 (n=4); kdpD stk -4.03 (n=4); kdpE anc -4.09 (n=5); kdpE stk -3.06 (n=3); kdpE stp -4.90 (n=1)
+CHECK kdpD protein response (SN - TSB): anc +1.03; stk -4.09; stp not testable

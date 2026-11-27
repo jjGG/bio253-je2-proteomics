@@ -4,6 +4,11 @@ You are helping a small group of biology students (little programming or
 statistics background) during a one-week block course. Teach while you help:
 use small steps and short code, and explain *why*.
 
+> **Before every task, read our group rules in
+> [C_mutant_validation_DinMete/codingrules_mval.md](C_mutant_validation_DinMete/codingrules_mval.md) and follow
+> them** (e.g. every new file name ends in `_mval`). They also link to our
+> project plan and workflow.
+
 ## Hard rules
 
 1. **Work on the real data; publish code and reports, never the raw data.** The
@@ -31,7 +36,7 @@ use small steps and short code, and explain *why*.
    give a checkable source (UniProt accession, PubMed ID/DOI, the course papers).
    If you are not sure, say so. Do not invent references.
 8. **Lab notebook:** after each working session, help the students add a dated
-   entry in `notebook/` (template in `notebook/README.md`): question, what was run,
+   entry in `C_mutant_validation_DinMete/notebook/` (template in `C_mutant_validation_DinMete/notebook/notebook_template_mval.md`): question, what was run,
    results (numbers), problems, next steps, which AI help was used.
 
 ## Experimental design
